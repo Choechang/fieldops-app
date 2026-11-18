@@ -16,6 +16,9 @@ import {
   ExternalLink,
 } from 'lucide-react';
 
+const SUPABASE_URL = 'https://rvzyjcsqdebhtqauapfi.supabase.co';
+const SUPABASE_ANON_KEY = 'sb_publishable_O6OrzT1Fy508DxwIQ9XC3w_vwb8uu3P';
+
 // --- [초기 더미 데이터] ---
 const INITIAL_CLIENTS = [
   {
