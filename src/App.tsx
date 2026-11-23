@@ -2163,23 +2163,40 @@ export default function App() {
       textarea.select();
       document.execCommand('copy');
       document.body.removeChild(textarea);
-      showToast(`${label}가 복사되었습니다.`);
+      showToast(`${label} 주소가 복사되었습니다.`);
     } catch (e) {
-      showToast('복사에 실패했습니다.');
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(
+          () => showToast(`${label} 주소가 복사되었습니다.`),
+          () => showToast('주소 복사에 실패했습니다.')
+        );
+      } else {
+        showToast('주소 복사에 실패했습니다.');
+      }
     }
   };
 
-  // --- [TMAP 공식 단일 목적지 URL 생성 (rGoName / rGoX / rGoY)] ---
+  // --- [TMAP 안드로이드·iOS 공용 단일 목적지 URL 생성 (goalname / goalx / goaly)] ---
   const buildSingleTmapUrl = (stop) => {
     const cleanName = (stop.name || '목적지')
       .replace(/[()]/g, ' ')
       .replace(/\s+/g, ' ')
       .trim();
-    const lng = Number(stop.lng).toFixed(6);
-    const lat = Number(stop.lat).toFixed(6);
-    return `tmap://route?rGoName=${encodeURIComponent(
+    const lng = Number(stop.lng);
+    const lat = Number(stop.lat);
+
+    if (
+      !Number.isFinite(lng) ||
+      !Number.isFinite(lat) ||
+      (lng === 0 && lat === 0)
+    ) {
+      return `tmap://search?name=${encodeURIComponent(cleanName)}`;
+    }
+
+    // 안드로이드·iOS TMAP 모두 목적지를 즉시 인식하는 표준 파라미터(goalname, goalx, goaly) 사용
+    return `tmap://route?goalname=${encodeURIComponent(
       cleanName
-    )}&rGoX=${lng}&rGoY=${lat}`;
+    )}&goalx=${lng.toFixed(6)}&goaly=${lat.toFixed(6)}`;
   };
 
   // --- [7. TMAP / 네이버 지도 길안내 페이로드 생성 (동기식 즉시 실행)] ---
@@ -2266,7 +2283,7 @@ export default function App() {
       ...orderedStops,
     ];
 
-    // TMAP은 웹 URL 스킴에서 단일 목적지(rGoName/X/Y)만 공식 인식하므로
+    // TMAP은 웹 URL 스킴에서 단일 목적지(goalname/goalx/goaly)만 공식 인식하므로
     // 첫 번째 목적지 URL을 기본 딥링크로 생성하고, 나머지 경유지는 순차 릴레이로 제공
     const firstTmapStop = orderedStops[0];
     const tmapFirstLink = buildSingleTmapUrl(firstTmapStop);
