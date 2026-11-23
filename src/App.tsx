@@ -312,8 +312,9 @@ export default function App() {
   const [plannedVisits, setPlannedVisits] = useState([]);
   const [optimizationNote, setOptimizationNote] = useState('');
   const [autoFillMorningGap, setAutoFillMorningGap] = useState(true);
-  // 스마트폰 실주행 시 기본값은 '현재 GPS 위치에서 출발'이 경유지 인식률이 가장 높음
-  const [includeOriginInNavi, setIncludeOriginInNavi] = useState(false);
+  // 스마트폰 실주행 시 출발지(현위치)와 최종 도착지(자택)가 겹쳐 경유지가 무시되는 현상을 막기 위해
+  // 기본값은 마지막 방문 고객사를 최종 목적지로 설정 (필요 시 복귀지 포함 체크 가능)
+  const [includeReturnInNavi, setIncludeReturnInNavi] = useState(false);
 
   // 자택 / 회사 환경설정 (주소 + 좌표)
   const [homeAddress, setHomeAddress] = useState(
@@ -566,6 +567,16 @@ export default function App() {
     const tokens = raw.split(/\s+/).filter(Boolean);
     const lastToken = tokens.length > 1 ? tokens[tokens.length - 1] : null;
 
+    // 모바일 통신망 지연으로 전체 검색이 멈추지 않도록 개별 API에 3.5초 타임아웃 적용
+    const fetchJsonWithTimeout = (url, fallbackValue) => {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 3500);
+      return fetch(url, { signal: controller.signal })
+        .then((r) => (r.ok ? r.json() : fallbackValue))
+        .catch(() => fallbackValue)
+        .finally(() => clearTimeout(timer));
+    };
+
     // 1) ArcGIS 한국 지오코더 (langCode=ko 적용으로 한국어 주소 반환)
     const arcgisQueries = [normalized];
     if (coreOrgName && coreOrgName !== normalized && coreOrgName.length >= 2) {
@@ -573,13 +584,12 @@ export default function App() {
     }
 
     const arcgisRequests = arcgisQueries.map((q) =>
-      fetch(
+      fetchJsonWithTimeout(
         `https://geocode.arcgis.com/arcgis/rest/services/World/GeocodeServer/findAddressCandidates?SingleLine=${encodeURIComponent(
           q
-        )}&countryCode=KOR&langCode=ko&outFields=PlaceName,Place_addr,Match_addr,Type&maxLocations=6&f=json`
+        )}&countryCode=KOR&langCode=ko&outFields=PlaceName,Place_addr,Match_addr,Type&maxLocations=6&f=json`,
+        { candidates: [] }
       )
-        .then((r) => (r.ok ? r.json() : { candidates: [] }))
-        .catch(() => ({ candidates: [] }))
     );
 
     // 2) Photon(lang=default로 현지 한국어 태그 우선) & Nominatim 보조 검색
@@ -588,34 +598,31 @@ export default function App() {
       : coreOrgName || normalized;
 
     const osmRequests = [
-      fetch(
+      fetchJsonWithTimeout(
         `https://photon.komoot.io/api/?q=${encodeURIComponent(
           osmTargetQuery
-        )}&lang=default&limit=6&lat=37.5665&lon=126.9780`
-      )
-        .then((r) => (r.ok ? r.json() : { features: [] }))
-        .catch(() => ({ features: [] })),
+        )}&lang=default&limit=6&lat=37.5665&lon=126.9780`,
+        { features: [] }
+      ),
 
-      fetch(
+      fetchJsonWithTimeout(
         `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(
           osmTargetQuery
-        )}&countrycodes=kr&limit=5&accept-language=ko&addressdetails=1`
-      )
-        .then((r) => (r.ok ? r.json() : []))
-        .catch(() => []),
+        )}&countrycodes=kr&limit=5&accept-language=ko&addressdetails=1`,
+        []
+      ),
     ];
 
     if (!isJibun && lastToken && lastToken.length >= 2) {
       const strippedLast = stripKoreanOrgSuffix(lastToken);
       if (strippedLast.length >= 2) {
         osmRequests.push(
-          fetch(
+          fetchJsonWithTimeout(
             `https://photon.komoot.io/api/?q=${encodeURIComponent(
               strippedLast
-            )}&lang=default&limit=5&lat=37.5665&lon=126.9780`
+            )}&lang=default&limit=5&lat=37.5665&lon=126.9780`,
+            { features: [] }
           )
-            .then((r) => (r.ok ? r.json() : { features: [] }))
-            .catch(() => ({ features: [] }))
         );
       }
     }
@@ -906,6 +913,161 @@ export default function App() {
       }
     } catch (e) {
       // 동기화 실패 시 로컬 유지
+    }
+  };
+
+  // --- [카카오/다음 공식 우편번호·건물명 검색기 로드 및 실행] ---
+  const openDaumPostcodeModal = (target, initialQuery = '') => {
+    setPostcodeInitialQuery((initialQuery || '').trim());
+    setPostcodeModalTarget(target);
+  };
+
+  useEffect(() => {
+    if (!postcodeModalTarget) return;
+
+    const renderPostcode = () => {
+      if (!window.daum || !window.daum.Postcode || !postcodeContainerRef.current) {
+        return;
+      }
+      postcodeContainerRef.current.innerHTML = '';
+      new window.daum.Postcode({
+        oncomplete: async (data) => {
+          const baseRoad = data.roadAddress || data.jibunAddress || '';
+          const bName = (data.buildingName || '').trim();
+          const formattedAddress = bName ? `${baseRoad} (${bName})` : baseRoad;
+
+          setPostcodeModalTarget(null);
+          showToast('좌표 변환 중...');
+
+          let coords = await resolveCoordinates(baseRoad, bName);
+          if ((!coords.lat || !coords.lng) && data.jibunAddress) {
+            coords = await resolveCoordinates(data.jibunAddress, bName);
+          }
+
+          if (postcodeModalTarget === 'client') {
+            if (bName) setNewName(bName);
+            setNewAddress(formattedAddress);
+            setNewCoords(coords);
+            setSearchResults([]);
+            setSearchKeyword('');
+            showToast('공식 주소와 GPS 좌표가 입력되었습니다.');
+          } else if (postcodeModalTarget === 'home') {
+            setHomeAddress(formattedAddress);
+            setHomeCoords(coords);
+            safeStorage.setItem('fieldops_home', formattedAddress);
+            safeStorage.setItem('fieldops_home_coords', JSON.stringify(coords));
+            setHomeSearchResults([]);
+            setHomeSearchQuery('');
+            showToast('자택 공식 주소와 GPS 좌표가 적용되었습니다.');
+          } else if (postcodeModalTarget === 'office') {
+            setOfficeAddress(formattedAddress);
+            setOfficeCoords(coords);
+            safeStorage.setItem('fieldops_office', formattedAddress);
+            safeStorage.setItem('fieldops_office_coords', JSON.stringify(coords));
+            setOfficeSearchResults([]);
+            setOfficeSearchQuery('');
+            showToast('회사 공식 주소와 GPS 좌표가 적용되었습니다.');
+          }
+        },
+        width: '100%',
+        height: '100%',
+      }).embed(postcodeContainerRef.current, {
+        q: postcodeInitialQuery || undefined,
+      });
+    };
+
+    if (window.daum && window.daum.Postcode) {
+      renderPostcode();
+    } else {
+      const existingScript = document.getElementById('daum-postcode-script');
+      if (existingScript) {
+        existingScript.addEventListener('load', renderPostcode);
+      } else {
+        const script = document.createElement('script');
+        script.id = 'daum-postcode-script';
+        script.src =
+          'https://t1.daumcdn.net/mapjsapi/bundle/postcode/prod/postcode.v2.js';
+        script.async = true;
+        script.onload = renderPostcode;
+        script.onerror = () => {
+          setPostcodeModalTarget(null);
+          showToast('주소록 스크립트를 불러오지 못했습니다.');
+        };
+        document.body.appendChild(script);
+      }
+    }
+  }, [postcodeModalTarget, postcodeInitialQuery]);
+
+  // --- [실시간 입력 디바운스 자동완성] ---
+  useEffect(() => {
+    const trimmed = searchKeyword.trim();
+    if (trimmed.length < 2) {
+      if (trimmed.length === 0) setSearchResults([]);
+      return;
+    }
+    const timer = setTimeout(async () => {
+      setIsSearching(true);
+      try {
+        const data = await queryFlexiblePlaces(trimmed);
+        setSearchResults(data);
+      } finally {
+        setIsSearching(false);
+      }
+    }, 380);
+    return () => clearTimeout(timer);
+  }, [searchKeyword]);
+
+  useEffect(() => {
+    const trimmed = homeSearchQuery.trim();
+    if (trimmed.length < 2) {
+      if (trimmed.length === 0) setHomeSearchResults([]);
+      return;
+    }
+    const timer = setTimeout(async () => {
+      setIsSearchingHome(true);
+      try {
+        const data = await queryFlexiblePlaces(trimmed);
+        setHomeSearchResults(data);
+      } finally {
+        setIsSearchingHome(false);
+      }
+    }, 380);
+    return () => clearTimeout(timer);
+  }, [homeSearchQuery]);
+
+  useEffect(() => {
+    const trimmed = officeSearchQuery.trim();
+    if (trimmed.length < 2) {
+      if (trimmed.length === 0) setOfficeSearchResults([]);
+      return;
+    }
+    const timer = setTimeout(async () => {
+      setIsSearchingOffice(true);
+      try {
+        const data = await queryFlexiblePlaces(trimmed);
+        setOfficeSearchResults(data);
+      } finally {
+        setIsSearchingOffice(false);
+      }
+    }, 380);
+    return () => clearTimeout(timer);
+  }, [officeSearchQuery]);
+
+  // --- [2-A. 고객 등록 장소 검색] ---
+  const handlePlaceSearch = async (e) => {
+    e.preventDefault();
+    if (!searchKeyword.trim()) return;
+    setIsSearching(true);
+    try {
+      const data = await queryFlexiblePlaces(searchKeyword);
+      setSearchResults(data);
+      if (data.length === 0) {
+        openDaumPostcodeModal('client', searchKeyword);
+      }
+    } catch (error) {
+      showToast('장소 검색 중 네트워크 오류가 발생했습니다.');
+    } finally {
+      setIsSearching(false);
     }
   };
 
@@ -1394,12 +1556,12 @@ export default function App() {
           };
         })
       );
-
-      // 수도권 인접 권역(용인 수지 ↔ 송파 잠실 등 30km 이내) 안정적 포함
+      // 수도권 광역 권역(용인 수지 ↔ 송파 잠실 등 38km 이내) 안정적 포함
+      // 모바일 통신망에서 시/구 대표 좌표로 보정되더라도 동일 생활권 고객사가 누락되지 않도록 보완
       const sameZoneCandidates = enrichedCandidates
         .filter((cand) => {
           if (cand.distKm !== null) {
-            return cand.distKm <= 30;
+            return cand.distKm <= 38;
           }
           return cand.simScore > 0;
         })
@@ -1987,7 +2149,6 @@ export default function App() {
 
   // --- [7. TMAP / 네이버 지도 다중 경유지 길안내 URL 생성 (동기식 즉시 실행)] ---
   const buildNaviPayload = (app) => {
-    const startItem = dailySchedule.find((item) => item.type === 'START');
     const endItem = dailySchedule.find((item) => item.type === 'END');
 
     const rawVisits = [];
@@ -2017,38 +2178,22 @@ export default function App() {
       validVisits.push(stop);
     });
 
-    const rawOrigin =
-      includeOriginInNavi && startItem
+    const rawDest =
+      includeReturnInNavi && endItem
         ? {
-            id: 'origin-start',
-            name: startItem.naviName || startItem.title,
-            address: startItem.address,
+            id: 'dest-end',
+            name: endItem.naviName || endItem.title,
+            address: endItem.address,
             lat:
-              Number(startItem.lat) ||
-              (startPoint === 'HOME' ? homeCoords.lat : officeCoords.lat) ||
+              Number(endItem.lat) ||
+              (endPoint === 'HOME' ? homeCoords.lat : officeCoords.lat) ||
               0,
             lng:
-              Number(startItem.lng) ||
-              (startPoint === 'HOME' ? homeCoords.lng : officeCoords.lng) ||
+              Number(endItem.lng) ||
+              (endPoint === 'HOME' ? homeCoords.lng : officeCoords.lng) ||
               0,
           }
         : null;
-
-    const rawDest = endItem
-      ? {
-          id: 'dest-end',
-          name: endItem.naviName || endItem.title,
-          address: endItem.address,
-          lat:
-            Number(endItem.lat) ||
-            (endPoint === 'HOME' ? homeCoords.lat : officeCoords.lat) ||
-            0,
-          lng:
-            Number(endItem.lng) ||
-            (endPoint === 'HOME' ? homeCoords.lng : officeCoords.lng) ||
-            0,
-        }
-      : null;
 
     let waypointNodes = [];
     let finalDestNode = null;
@@ -2063,21 +2208,6 @@ export default function App() {
 
     if (!finalDestNode) {
       return null;
-    }
-
-    // 출발지와 최종 도착지가 100m 이내 동일 좌표면(자택->방문->자택)
-    // TMAP/네이버지도에서 경로 오류를 일으키므로 출발지를 현재 GPS로 자동 전환
-    let startNode = rawOrigin && rawOrigin.lat && rawOrigin.lng ? rawOrigin : null;
-    if (startNode && finalDestNode) {
-      const sameOriginDestDist = getDistanceKm(
-        startNode.lat,
-        startNode.lng,
-        finalDestNode.lat,
-        finalDestNode.lng
-      );
-      if (sameOriginDestDist !== null && sameOriginDestDist < 0.1) {
-        startNode = null;
-      }
     }
 
     // 최종 목적지와 50m 이내로 겹치는 마지막 경유지 제거
@@ -2097,25 +2227,17 @@ export default function App() {
     // TMAP(최대 5개) / 네이버 지도(최대 5개) 경유지 제한 준수
     const cappedWaypoints = waypointNodes.slice(0, 5);
     const displaySequence = [
-      ...(startNode
-        ? [startNode]
-        : [{ id: 'gps-now', name: '현재 GPS 위치 (출발)', lat: 0, lng: 0 }]),
+      { id: 'gps-now', name: '현재 GPS 위치 (출발)', lat: 0, lng: 0 },
       ...cappedWaypoints,
       finalDestNode,
     ];
 
     let deepLink = '';
     if (app === 'tmap') {
-      // TMAP 공식 다중 경유지 스킴: rGoName/X/Y + rV1~rV5Name/X/Y
+      // TMAP 공식 다중 경유지 스킴: 현위치 출발 기준 rGoName/X/Y(목적지) + rV1~rV5Name/X/Y(경유지)
       deepLink = `tmap://route?rGoName=${encodeURIComponent(
         finalDestNode.name
       )}&rGoX=${finalDestNode.lng}&rGoY=${finalDestNode.lat}`;
-
-      if (startNode) {
-        deepLink += `&rStName=${encodeURIComponent(startNode.name)}&rStX=${
-          startNode.lng
-        }&rStY=${startNode.lat}`;
-      }
 
       cappedWaypoints.forEach((wp, idx) => {
         deepLink += `&rV${idx + 1}Name=${encodeURIComponent(wp.name)}&rV${
@@ -2123,7 +2245,7 @@ export default function App() {
         }X=${wp.lng}&rV${idx + 1}Y=${wp.lat}`;
       });
     } else {
-      // 네이버 지도 공식 다중 경유지 스킴: dlat/dlng/dname + v1~v5 + appname
+      // 네이버 지도 공식 다중 경유지 스킴: 현위치 출발 기준 dlat/dlng/dname + v1~v5 + appname
       const appName = encodeURIComponent(
         typeof window !== 'undefined' && window.location?.origin
           ? window.location.origin
@@ -2132,12 +2254,6 @@ export default function App() {
       deepLink = `nmap://route/car?dlat=${finalDestNode.lat}&dlng=${
         finalDestNode.lng
       }&dname=${encodeURIComponent(finalDestNode.name)}`;
-
-      if (startNode) {
-        deepLink += `&slat=${startNode.lat}&slng=${
-          startNode.lng
-        }&sname=${encodeURIComponent(startNode.name)}`;
-      }
 
       cappedWaypoints.forEach((wp, idx) => {
         deepLink += `&v${idx + 1}lat=${wp.lat}&v${idx + 1}lng=${
@@ -2184,6 +2300,7 @@ export default function App() {
     if (isMobile) {
       window.location.href = payload.deepLink;
 
+      // OS의 "앱에서 열겠습니까?" 시스템 확인창이 떠 있는 시간을 고려해 3.2초 후 폴백 안내
       setTimeout(() => {
         if (!document.hidden) {
           setNaviGuideModal({
@@ -2191,7 +2308,7 @@ export default function App() {
             isFallback: true,
           });
         }
-      }, 1800);
+      }, 3200);
     } else {
       setNaviGuideModal({
         ...payload,
@@ -2830,12 +2947,12 @@ export default function App() {
                         <label className="flex items-center gap-2 cursor-pointer">
                           <input
                             type="checkbox"
-                            checked={includeOriginInNavi}
-                            onChange={(e) => setIncludeOriginInNavi(e.target.checked)}
+                            checked={includeReturnInNavi}
+                            onChange={(e) => setIncludeReturnInNavi(e.target.checked)}
                             className="w-4 h-4 accent-blue-600 rounded"
                           />
                           <span className="text-xs font-bold text-slate-700">
-                            내비 출발지에 [{startPoint === 'HOME' ? '자택' : '회사'}] 고정 지정
+                            복귀지([{endPoint === 'HOME' ? '자택' : '회사'}])까지 최종 목적지에 포함
                           </span>
                         </label>
                         <button
@@ -2848,18 +2965,17 @@ export default function App() {
                         </button>
                       </div>
                       <p className="text-[11px] text-slate-500 leading-relaxed">
-                        전송 동선:{' '}
+                        내비 전송 동선:{' '}
                         <strong className="text-slate-700">
-                          {includeOriginInNavi && startPoint !== endPoint
-                            ? `${startPoint === 'HOME' ? '자택(출발)' : '회사(출발)'} → `
-                            : '현재 GPS 위치 → '}
-                          {plannedVisits.map((v) => v.name).join(' → ')} →{' '}
-                          {endPoint === 'HOME' ? '자택(도착)' : '회사(복귀)'}
+                          현재 GPS 위치 → {plannedVisits.map((v) => v.name).join(' → ')}
+                          {includeReturnInNavi
+                            ? ` → ${endPoint === 'HOME' ? '자택(도착)' : '회사(복귀)'}`
+                            : ' (최종 목적지)'}
                         </strong>
                       </p>
-                      {includeOriginInNavi && startPoint === endPoint && (
+                      {includeReturnInNavi && (
                         <p className="text-[10px] text-amber-700 font-medium">
-                          ※ 출발지와 복귀지가 동일할 경우 내비 앱 경로 오류 방지를 위해 현재 GPS 위치 출발로 자동 전환됩니다.
+                          ※ 자택에서 출발 직전 전송 시 현재 GPS와 복귀지(자택)가 같으면 내비 앱에서 경로 오류가 날 수 있으니 체크를 끄고 전송하세요.
                         </p>
                       )}
                     </div>
