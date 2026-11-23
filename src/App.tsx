@@ -1576,10 +1576,10 @@ export default function App() {
         });
 
       const OFFICE_EARLIEST_DEPART = 9 * 60;
-      const DIRECT_ARRIVE_MIN = 9 * 60 + 30;
-      const DIRECT_ARRIVE_MAX = 10 * 60;
+      const DIRECT_ARRIVE_MIN = 9 * 60 + 30; // 직출 시 첫 고객사 09:30 도착 기준
       const LUNCH_START = 11 * 60 + 30;
       const LUNCH_END = 13 * 60;
+      const DIRECT_LEAVE_MIN = 17 * 60; // 직퇴 시 최소 17:00까지 고객사 상주 기준
       const DAY_END = 17 * 60 + 30;
 
       const originPoint =
@@ -1712,13 +1712,8 @@ export default function App() {
             }] 일정까지 연속 배정했습니다.`;
           }
         } else {
-          const targetArrival =
-            useSmartMorning && firstWork < LUNCH_START - DIRECT_ARRIVE_MIN
-              ? Math.min(
-                  DIRECT_ARRIVE_MAX,
-                  Math.max(DIRECT_ARRIVE_MIN, LUNCH_START - firstWork)
-                )
-              : DIRECT_ARRIVE_MIN;
+          // 직출 시 오전 단독 일정이어도 반드시 09:30 고객사 도착 기준으로 출발 시각 역산
+          const targetArrival = DIRECT_ARRIVE_MIN;
           const homeDepartTime = targetArrival - firstTravel;
 
           finalVisitList.push(seedClient);
@@ -1728,7 +1723,7 @@ export default function App() {
             time: formatTime(homeDepartTime),
             title: '자택 출발 (직출)',
             naviName: '자택 (출발)',
-            detail: `${formatTime(targetArrival)} 현장 도착 기준`,
+            detail: '09:30 첫 현장 도착 기준',
             address: homeAddress,
             lat: activeHomeCoords.lat,
             lng: activeHomeCoords.lng,
@@ -1757,17 +1752,15 @@ export default function App() {
           lunchInserted = splitRes.lunchInserted;
 
           if (splitRes.wasSplit) {
-            note = `${formatTime(targetArrival)} 도착 후 오전 11:30까지 [${
+            note = `09:30 도착 후 오전 11:30까지 [${
               seedClient.name
             }] 1차(${splitRes.morningChunk}분)를 진행하고, 점심시간(11:30~13:00) 이후 오후에 잔여 ${
               splitRes.afternoonChunk
             }분을 이어서 마무리합니다.`;
           } else {
-            note = `고객사 ${formatTime(
-              targetArrival
-            )} 도착(09:30~10:00 기준)에 맞춰 자택에서 ${formatTime(
+            note = `직출 기준(09:30 현장 도착)에 맞춰 자택에서 ${formatTime(
               homeDepartTime
-            )}에 출발(이동 ${firstTravel}분)하는 직출 일정을 구성했습니다.`;
+            )}에 출발(이동 ${firstTravel}분)하는 일정을 구성했습니다.`;
           }
         }
       } else {
@@ -2007,9 +2000,13 @@ export default function App() {
       const remainingAfternoonPool = sameZoneCandidates.filter(
         (c) => !usedIds.has(c.id)
       );
+      // 직퇴 시에는 회사 복귀 이동이 없으므로 17:30까지 오후 고객사 추가 배정 허용
+      const afternoonVisitCutoff =
+        overrideEnd === 'HOME' ? 17 * 60 + 30 : DAY_END;
+      const maxDailyVisits = overrideEnd === 'HOME' ? 4 : 3;
 
       for (let i = 0; i < remainingAfternoonPool.length; i++) {
-        if (finalVisitList.length >= 3) break;
+        if (finalVisitList.length >= maxDailyVisits) break;
         const prevClient = finalVisitList[finalVisitList.length - 1];
         const nextClient = remainingAfternoonPool[i];
         const nextWork = Number(nextClient.estimated_time) || 60;
@@ -2051,7 +2048,7 @@ export default function App() {
           projectedFinish = LUNCH_END + (nextWork - morningAvail);
         }
 
-        if (projectedFinish > DAY_END) {
+        if (projectedFinish > afternoonVisitCutoff) {
           break;
         }
 
@@ -2110,18 +2107,37 @@ export default function App() {
         currentTime = LUNCH_END;
       }
 
+      // 직퇴 선택 시 최소 17:00까지는 마지막 고객사에 상주한 뒤 출발하도록 보정
+      if (overrideEnd === 'HOME' && currentTime < DIRECT_LEAVE_MIN) {
+        const stayMins = DIRECT_LEAVE_MIN - currentTime;
+        schedule.push({
+          type: 'CLIENT_STAY',
+          time: `${formatTime(currentTime)} ~ ${formatTime(DIRECT_LEAVE_MIN)}`,
+          title: `${lastClient.name} 현장 상주 및 점검 리포트 정리`,
+          detail: `직퇴 기준(17:00 이후 출발) · ${stayMins}분`,
+          address: lastClient.address,
+        });
+        currentTime = DIRECT_LEAVE_MIN;
+        note = `${
+          note ? note + ' ' : ''
+        }직퇴 규정에 따라 17:00까지 [${
+          lastClient.name
+        }] 현장에 상주하며 점검 결과 정리 후 자택으로 출발합니다.`;
+      }
+
+      const departFromLast = currentTime;
       const returnTravelInfo = await calculateRealTravelInfo(
         lastClient,
         returnPoint,
-        currentTime,
+        departFromLast,
         routeCacheRef.current
       );
       const returnTravel = returnTravelInfo.minutes;
-      const arrivalEnd = currentTime + returnTravel;
+      const arrivalEnd = departFromLast + returnTravel;
 
       schedule.push({
         type: 'TRAVEL',
-        time: `${formatTime(currentTime)} ~ ${formatTime(arrivalEnd)}`,
+        time: `${formatTime(departFromLast)} ~ ${formatTime(arrivalEnd)}`,
         duration: returnTravel,
         distanceKm: returnTravelInfo.distanceKm,
         label: returnTravelInfo.label,
@@ -2132,12 +2148,19 @@ export default function App() {
         time: formatTime(arrivalEnd),
         title:
           overrideEnd === 'HOME' ? '자택 도착 (직퇴)' : '회사 복귀 (퇴근)',
+        detail:
+          overrideEnd === 'HOME'
+            ? `${formatTime(departFromLast)} 현장 출발 기준`
+            : '회사 복귀 완료',
         naviName:
           overrideEnd === 'HOME' ? '자택 (도착)' : '회사 (복귀)',
         address: overrideEnd === 'HOME' ? homeAddress : officeAddress,
         lat: returnPoint.lat,
         lng: returnPoint.lng,
-        isOvertime: arrivalEnd > DAY_END,
+        isOvertime:
+          overrideEnd === 'OFFICE'
+            ? arrivalEnd > DAY_END
+            : departFromLast > 18 * 60,
       });
 
       setPlannedVisits(finalVisitList);
@@ -2860,6 +2883,32 @@ export default function App() {
                   </div>
                 </div>
 
+                {/* 직출 09:30 / 직퇴 17:00 적용 규칙 안내 배지 */}
+                <div className="flex flex-wrap gap-1.5 pt-0.5">
+                  <span
+                    className={`text-[10px] font-bold px-2.5 py-1 rounded-lg border ${
+                      startPoint === 'HOME'
+                        ? 'bg-blue-50 text-blue-700 border-blue-200'
+                        : 'bg-slate-50 text-slate-600 border-slate-200'
+                    }`}
+                  >
+                    {startPoint === 'HOME'
+                      ? '직출 기준: 09:30 첫 고객사 도착'
+                      : '출근 기준: 09:00 이후 회사 출발'}
+                  </span>
+                  <span
+                    className={`text-[10px] font-bold px-2.5 py-1 rounded-lg border ${
+                      endPoint === 'HOME'
+                        ? 'bg-teal-50 text-teal-700 border-teal-200'
+                        : 'bg-slate-50 text-slate-600 border-slate-200'
+                    }`}
+                  >
+                    {endPoint === 'HOME'
+                      ? '직퇴 기준: 17:00까지 고객사 상주 후 출발'
+                      : '복귀 기준: 점검 종료 즉시 회사 복귀'}
+                  </span>
+                </div>
+
                 <label className="flex items-center justify-between pt-1 border-t border-slate-100 cursor-pointer">
                   <span className="text-xs font-medium text-slate-600">
                     오전 공백 자동 채움 (11:30 전 인접 일정/분할 배정)
@@ -2954,6 +3003,8 @@ export default function App() {
                                 ? 'bg-slate-800'
                                 : ev.type === 'OFFICE_WORK'
                                 ? 'bg-indigo-600'
+                                : ev.type === 'CLIENT_STAY'
+                                ? 'bg-teal-600'
                                 : ev.type === 'LUNCH'
                                 ? 'bg-amber-500'
                                 : 'bg-blue-600'
@@ -2963,6 +3014,8 @@ export default function App() {
                               <Home className="w-3 h-3" />
                             ) : ev.type === 'OFFICE_WORK' ? (
                               <Briefcase className="w-3 h-3" />
+                            ) : ev.type === 'CLIENT_STAY' ? (
+                              <Clock className="w-3 h-3" />
                             ) : ev.type === 'LUNCH' ? (
                               <Coffee className="w-3 h-3" />
                             ) : (
@@ -2978,6 +3031,8 @@ export default function App() {
                                 ? 'bg-amber-50 border border-amber-200/80'
                                 : ev.type === 'OFFICE_WORK'
                                 ? 'bg-indigo-50/60 border border-indigo-200/80'
+                                : ev.type === 'CLIENT_STAY'
+                                ? 'bg-teal-50/70 border border-teal-200/80'
                                 : ev.type === 'VISIT'
                                 ? 'bg-blue-50/40 border border-blue-100'
                                 : 'bg-slate-50 border border-slate-100'
@@ -2990,6 +3045,8 @@ export default function App() {
                                     ? 'bg-amber-200/70 text-amber-900'
                                     : ev.type === 'OFFICE_WORK'
                                     ? 'bg-indigo-100 text-indigo-800'
+                                    : ev.type === 'CLIENT_STAY'
+                                    ? 'bg-teal-100 text-teal-800'
                                     : ev.type === 'VISIT'
                                     ? 'bg-blue-100 text-blue-800'
                                     : 'bg-slate-200 text-slate-700'
@@ -3002,6 +3059,8 @@ export default function App() {
                                   className={`text-[11px] font-bold ${
                                     ev.type === 'OFFICE_WORK'
                                       ? 'text-indigo-600'
+                                      : ev.type === 'CLIENT_STAY'
+                                      ? 'text-teal-700'
                                       : 'text-blue-600'
                                   }`}
                                 >
