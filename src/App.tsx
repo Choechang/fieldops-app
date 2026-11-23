@@ -27,6 +27,8 @@ import {
   Car,
   ExternalLink,
   Eye,
+  Copy,
+  ArrowRight,
 } from 'lucide-react';
 
 // --- [Supabase 클라우드 DB 설정] ---
@@ -365,6 +367,7 @@ export default function App() {
   const [toastMessage, setToastMessage] = useState('');
   const [confirmDialog, setConfirmDialog] = useState(null);
   const [naviGuideModal, setNaviGuideModal] = useState(null);
+  const [tmapStepIndex, setTmapStepIndex] = useState(0);
 
   // 고객 등록 폼 상태
   const [newName, setNewName] = useState('');
@@ -2140,6 +2143,7 @@ export default function App() {
       setPlannedVisits(finalVisitList);
       setDailySchedule(schedule);
       setOptimizationNote(note);
+      setTmapStepIndex(0);
     } catch (error) {
       showToast('일과표 생성 중 오류가 발생했습니다.');
     } finally {
@@ -2147,7 +2151,38 @@ export default function App() {
     }
   };
 
-  // --- [7. TMAP / 네이버 지도 다중 경유지 길안내 URL 생성 (동기식 즉시 실행)] ---
+  // --- [안전한 클립보드 복사 유틸리티 (iFrame/모바일 호환)] ---
+  const copyTextSafe = (text, label = '주소') => {
+    try {
+      const textarea = document.createElement('textarea');
+      textarea.value = text;
+      textarea.style.position = 'fixed';
+      textarea.style.opacity = '0';
+      document.body.appendChild(textarea);
+      textarea.focus();
+      textarea.select();
+      document.execCommand('copy');
+      document.body.removeChild(textarea);
+      showToast(`${label}가 복사되었습니다.`);
+    } catch (e) {
+      showToast('복사에 실패했습니다.');
+    }
+  };
+
+  // --- [TMAP 공식 단일 목적지 URL 생성 (rGoName / rGoX / rGoY)] ---
+  const buildSingleTmapUrl = (stop) => {
+    const cleanName = (stop.name || '목적지')
+      .replace(/[()]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    const lng = Number(stop.lng).toFixed(6);
+    const lat = Number(stop.lat).toFixed(6);
+    return `tmap://route?rGoName=${encodeURIComponent(
+      cleanName
+    )}&rGoX=${lng}&rGoY=${lat}`;
+  };
+
+  // --- [7. TMAP / 네이버 지도 길안내 페이로드 생성 (동기식 즉시 실행)] ---
   const buildNaviPayload = (app) => {
     const endItem = dailySchedule.find((item) => item.type === 'END');
 
@@ -2156,12 +2191,23 @@ export default function App() {
     dailySchedule.forEach((item) => {
       if (item.type === 'VISIT' && item.client && !seenIds.has(item.client.id)) {
         seenIds.add(item.client.id);
+        let lat = Number(item.client.lat) || 0;
+        let lng = Number(item.client.lng) || 0;
+        if (!lat || !lng) {
+          const fallback =
+            getFallbackAdminCoords(item.client.address) ||
+            getFallbackAdminCoords(item.client.name);
+          if (fallback) {
+            lat = fallback.lat;
+            lng = fallback.lng;
+          }
+        }
         rawVisits.push({
           id: `visit-${item.client.id}`,
           name: item.client.name,
           address: item.client.address,
-          lat: Number(item.client.lat) || 0,
-          lng: Number(item.client.lng) || 0,
+          lat,
+          lng,
         });
       }
     });
@@ -2195,88 +2241,111 @@ export default function App() {
           }
         : null;
 
-    let waypointNodes = [];
-    let finalDestNode = null;
-
+    let orderedStops = [...validVisits];
     if (rawDest && rawDest.lat && rawDest.lng) {
-      waypointNodes = [...validVisits];
-      finalDestNode = rawDest;
-    } else if (validVisits.length > 0) {
-      waypointNodes = validVisits.slice(0, validVisits.length - 1);
-      finalDestNode = validVisits[validVisits.length - 1];
-    }
-
-    if (!finalDestNode) {
-      return null;
-    }
-
-    // 최종 목적지와 50m 이내로 겹치는 마지막 경유지 제거
-    if (waypointNodes.length > 0) {
-      const lastWp = waypointNodes[waypointNodes.length - 1];
-      const distToDest = getDistanceKm(
-        lastWp.lat,
-        lastWp.lng,
-        finalDestNode.lat,
-        finalDestNode.lng
-      );
-      if (distToDest !== null && distToDest < 0.05) {
-        waypointNodes.pop();
+      const lastStop = orderedStops[orderedStops.length - 1];
+      const distToDest = lastStop
+        ? getDistanceKm(lastStop.lat, lastStop.lng, rawDest.lat, rawDest.lng)
+        : null;
+      if (distToDest === null || distToDest >= 0.05) {
+        orderedStops.push(rawDest);
       }
     }
 
-    // TMAP(최대 5개) / 네이버 지도(최대 5개) 경유지 제한 준수
+    if (orderedStops.length === 0) {
+      return null;
+    }
+
+    const waypointNodes = orderedStops.slice(0, orderedStops.length - 1);
+    const finalDestNode = orderedStops[orderedStops.length - 1];
+
+    // 네이버 지도(최대 5개) 경유지 제한 준수
     const cappedWaypoints = waypointNodes.slice(0, 5);
     const displaySequence = [
       { id: 'gps-now', name: '현재 GPS 위치 (출발)', lat: 0, lng: 0 },
-      ...cappedWaypoints,
-      finalDestNode,
+      ...orderedStops,
     ];
 
-    let deepLink = '';
-    if (app === 'tmap') {
-      // TMAP 공식 다중 경유지 스킴: 현위치 출발 기준 rGoName/X/Y(목적지) + rV1~rV5Name/X/Y(경유지)
-      deepLink = `tmap://route?rGoName=${encodeURIComponent(
-        finalDestNode.name
-      )}&rGoX=${finalDestNode.lng}&rGoY=${finalDestNode.lat}`;
+    // TMAP은 웹 URL 스킴에서 단일 목적지(rGoName/X/Y)만 공식 인식하므로
+    // 첫 번째 목적지 URL을 기본 딥링크로 생성하고, 나머지 경유지는 순차 릴레이로 제공
+    const firstTmapStop = orderedStops[0];
+    const tmapFirstLink = buildSingleTmapUrl(firstTmapStop);
 
-      cappedWaypoints.forEach((wp, idx) => {
-        deepLink += `&rV${idx + 1}Name=${encodeURIComponent(wp.name)}&rV${
-          idx + 1
-        }X=${wp.lng}&rV${idx + 1}Y=${wp.lat}`;
-      });
-    } else {
-      // 네이버 지도 공식 다중 경유지 스킴: 현위치 출발 기준 dlat/dlng/dname + v1~v5 + appname
-      const appName = encodeURIComponent(
-        typeof window !== 'undefined' && window.location?.origin
-          ? window.location.origin
-          : 'fieldops.scheduler'
-      );
-      deepLink = `nmap://route/car?dlat=${finalDestNode.lat}&dlng=${
-        finalDestNode.lng
-      }&dname=${encodeURIComponent(finalDestNode.name)}`;
+    // 네이버 지도 공식 다중 경유지 스킴: 현위치 출발 기준 dlat/dlng/dname + v1~v5 + appname
+    const cleanDestName = (finalDestNode.name || '목적지')
+      .replace(/[()]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+    let naverDeepLink = `nmap://route/car?dlat=${Number(
+      finalDestNode.lat
+    ).toFixed(6)}&dlng=${Number(finalDestNode.lng).toFixed(
+      6
+    )}&dname=${encodeURIComponent(cleanDestName)}`;
 
-      cappedWaypoints.forEach((wp, idx) => {
-        deepLink += `&v${idx + 1}lat=${wp.lat}&v${idx + 1}lng=${
-          wp.lng
-        }&v${idx + 1}name=${encodeURIComponent(wp.name)}`;
-      });
+    cappedWaypoints.forEach((wp, idx) => {
+      const cleanWpName = (wp.name || `경유지${idx + 1}`)
+        .replace(/[()]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+      naverDeepLink += `&v${idx + 1}lat=${Number(wp.lat).toFixed(6)}&v${
+        idx + 1
+      }lng=${Number(wp.lng).toFixed(6)}&v${idx + 1}name=${encodeURIComponent(
+        cleanWpName
+      )}`;
+    });
 
-      deepLink += `&appname=${appName}`;
-    }
+    naverDeepLink += `&appname=com.fieldops.scheduler`;
 
     return {
       appName: app === 'tmap' ? 'TMAP' : '네이버 지도',
       appKey: app,
-      deepLink,
+      deepLink: app === 'tmap' ? tmapFirstLink : naverDeepLink,
       visits: displaySequence,
-      singleStops: [...cappedWaypoints, finalDestNode],
+      singleStops: orderedStops,
       webUrl:
         app === 'naver'
           ? `https://map.naver.com/p/search/${encodeURIComponent(
-              finalDestNode.name
+              cleanDestName
             )}`
           : null,
     };
+  };
+
+  // TMAP 특정 순번 목적지 즉시 실행 (동기식 사용자 제스처 유지)
+  const launchTmapStopByIndex = (stopIdx) => {
+    const payload = buildNaviPayload('tmap');
+    if (!payload || !payload.singleStops[stopIdx]) {
+      showToast('전송할 목적지 좌표를 찾을 수 없습니다.');
+      return;
+    }
+
+    const targetStop = payload.singleStops[stopIdx];
+    const singleUrl = buildSingleTmapUrl(targetStop);
+    const nextIdx =
+      stopIdx + 1 < payload.singleStops.length ? stopIdx + 1 : stopIdx;
+    setTmapStepIndex(nextIdx);
+
+    const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+    if (isMobile) {
+      window.location.href = singleUrl;
+      setTimeout(() => {
+        if (!document.hidden) {
+          setNaviGuideModal({
+            ...payload,
+            deepLink: singleUrl,
+            activeStopName: targetStop.name,
+            isFallback: true,
+          });
+        }
+      }, 3000);
+    } else {
+      setNaviGuideModal({
+        ...payload,
+        deepLink: singleUrl,
+        activeStopName: targetStop.name,
+        isFallback: false,
+      });
+    }
   };
 
   // 반드시 동기 함수로 유지해야 iOS Safari / 모바일 Chrome에서 사용자 제스처가 유지됨
@@ -2292,6 +2361,11 @@ export default function App() {
         ...payload,
         isFallback: false,
       });
+      return;
+    }
+
+    if (app === 'tmap') {
+      launchTmapStopByIndex(tmapStepIndex);
       return;
     }
 
@@ -2980,14 +3054,102 @@ export default function App() {
                       )}
                     </div>
 
-                    <button
-                      type="button"
-                      onClick={() => launchMultiNavi('tmap')}
-                      className="w-full bg-[#00498c] hover:bg-[#003a70] text-white font-bold py-3.5 rounded-xl shadow-md flex items-center justify-center gap-2 text-sm transition-colors"
-                    >
-                      <Navigation className="w-4 h-4 text-blue-200" />
-                      <span>TMAP 다중 경유지 한 번에 전송</span>
-                    </button>
+                    {/* TMAP 원터치 순차 릴레이 안내 패널 */}
+                    {(() => {
+                      const tmapPreview = buildNaviPayload('tmap');
+                      const stops = tmapPreview?.singleStops || [];
+                      if (stops.length === 0) return null;
+                      const currentStop =
+                        stops[Math.min(tmapStepIndex, stops.length - 1)];
+
+                      return (
+                        <div className="bg-blue-50/70 border border-blue-200 rounded-2xl p-3.5 space-y-2.5">
+                          <div className="flex items-center justify-between">
+                            <span className="text-xs font-bold text-[#00498c] flex items-center gap-1.5">
+                              <Navigation className="w-3.5 h-3.5" />
+                              <span>TMAP 순차 길안내 릴레이</span>
+                            </span>
+                            <span className="text-[10px] font-bold bg-white text-[#00498c] px-2 py-0.5 rounded-full border border-blue-200">
+                              {Math.min(tmapStepIndex + 1, stops.length)} /{' '}
+                              {stops.length}단계
+                            </span>
+                          </div>
+
+                          <p className="text-[11px] text-slate-600 leading-relaxed">
+                            TMAP은 외부 호출 시 <strong>단일 목적지</strong>만 공식 지원합니다. 아래 버튼으로 1번부터 순서대로 즉시 전송하세요.
+                          </p>
+
+                          <div className="space-y-1.5">
+                            {stops.map((st, idx) => {
+                              const isCurrent = idx === tmapStepIndex;
+                              return (
+                                <div
+                                  key={st.id}
+                                  className={`flex items-center justify-between gap-2 px-2.5 py-2 rounded-xl border text-xs ${
+                                    isCurrent
+                                      ? 'bg-white border-blue-400 shadow-sm font-bold text-slate-900'
+                                      : 'bg-white/60 border-slate-200/80 text-slate-600'
+                                  }`}
+                                >
+                                  <div className="min-w-0 flex items-center gap-1.5">
+                                    <span
+                                      className={`w-4 h-4 rounded-full text-[10px] flex items-center justify-center shrink-0 font-bold ${
+                                        isCurrent
+                                          ? 'bg-[#00498c] text-white'
+                                          : 'bg-slate-200 text-slate-600'
+                                      }`}
+                                    >
+                                      {idx + 1}
+                                    </span>
+                                    <span className="truncate">{st.name}</span>
+                                  </div>
+                                  <div className="flex items-center gap-1 shrink-0">
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        copyTextSafe(
+                                          st.address || st.name,
+                                          st.name
+                                        )
+                                      }
+                                      title="주소 복사 (티맵 경유지 직접 붙여넣기용)"
+                                      className="p-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-600"
+                                    >
+                                      <Copy className="w-3 h-3" />
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => launchTmapStopByIndex(idx)}
+                                      className={`px-2.5 py-1 rounded-lg text-[11px] font-bold flex items-center gap-1 ${
+                                        isCurrent
+                                          ? 'bg-[#00498c] text-white'
+                                          : 'bg-blue-100 text-[#00498c]'
+                                      }`}
+                                    >
+                                      <span>TMAP</span>
+                                      <ArrowRight className="w-3 h-3" />
+                                    </button>
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
+
+                          <button
+                            type="button"
+                            onClick={() => launchTmapStopByIndex(tmapStepIndex)}
+                            className="w-full bg-[#00498c] hover:bg-[#003a70] text-white font-bold py-3.5 rounded-xl shadow-md flex items-center justify-center gap-2 text-sm transition-colors"
+                          >
+                            <Navigation className="w-4 h-4 text-blue-200" />
+                            <span>
+                              {Math.min(tmapStepIndex + 1, stops.length)}번 [
+                              {currentStop?.name}] TMAP 바로 실행
+                            </span>
+                          </button>
+                        </div>
+                      );
+                    })()}
+
                     <button
                       type="button"
                       onClick={() => launchMultiNavi('naver')}
@@ -3280,7 +3442,11 @@ export default function App() {
             <div className="bg-white rounded-3xl p-6 w-full max-w-sm shadow-2xl space-y-4">
               <div className="flex items-center gap-2 text-blue-600 font-bold text-lg">
                 <Navigation className="w-5 h-5" />
-                <span>{naviGuideModal.appName} 다중 경유지 전송</span>
+                <span>
+                  {naviGuideModal.appKey === 'tmap'
+                    ? 'TMAP 순차 목적지 전송'
+                    : `${naviGuideModal.appName} 다중 경유지 전송`}
+                </span>
               </div>
 
               <div className="bg-slate-50 rounded-2xl p-3.5 space-y-2 text-xs text-slate-700 max-h-56 overflow-y-auto">
@@ -3297,25 +3463,35 @@ export default function App() {
                         : `경유 ${i}: ${v.name}`}
                     </span>
                     {v.lat && v.lng ? (
-                      <a
-                        href={
-                          naviGuideModal.appKey === 'tmap'
-                            ? `tmap://route?rGoName=${encodeURIComponent(
-                                v.name
-                              )}&rGoX=${v.lng}&rGoY=${v.lat}`
-                            : `nmap://route/car?dlat=${v.lat}&dlng=${
-                                v.lng
-                              }&dname=${encodeURIComponent(
-                                v.name
-                              )}&appname=${encodeURIComponent(
-                                window.location?.origin || 'fieldops.scheduler'
-                              )}`
-                        }
-                        className="shrink-0 text-[10px] bg-white border border-slate-300 px-2 py-1 rounded-lg text-blue-700 flex items-center gap-0.5"
-                      >
-                        <span>단독안내</span>
-                        <ExternalLink className="w-2.5 h-2.5" />
-                      </a>
+                      <div className="flex items-center gap-1 shrink-0">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            copyTextSafe(v.address || v.name, v.name)
+                          }
+                          className="text-[10px] bg-white border border-slate-300 px-1.5 py-1 rounded-lg text-slate-600"
+                          title="주소 복사"
+                        >
+                          복사
+                        </button>
+                        <a
+                          href={
+                            naviGuideModal.appKey === 'tmap'
+                              ? buildSingleTmapUrl(v)
+                              : `nmap://route/car?dlat=${Number(v.lat).toFixed(
+                                  6
+                                )}&dlng=${Number(v.lng).toFixed(
+                                  6
+                                )}&dname=${encodeURIComponent(
+                                  v.name
+                                )}&appname=com.fieldops.scheduler`
+                          }
+                          className="text-[10px] bg-white border border-slate-300 px-2 py-1 rounded-lg text-blue-700 flex items-center gap-0.5"
+                        >
+                          <span>바로안내</span>
+                          <ExternalLink className="w-2.5 h-2.5" />
+                        </a>
+                      </div>
                     ) : null}
                   </div>
                 ))}
@@ -3327,8 +3503,21 @@ export default function App() {
                 </p>
               ) : (
                 <p className="text-xs text-slate-500 leading-relaxed">
-                  스마트폰에서 실행 시 <strong>{naviGuideModal.appName}</strong>{' '}
-                  앱이 열리며 위 경유지 전체가 순서대로 입력됩니다.
+                  {naviGuideModal.appKey === 'tmap' ? (
+                    <>
+                      TMAP 웹 연동은 단일 목적지 규격만 지원하므로{' '}
+                      <strong>
+                        {naviGuideModal.activeStopName || '1번 목적지'}
+                      </strong>
+                      부터 순서대로 실행됩니다. 한 번에 전체 경유지를 넣으려면{' '}
+                      <strong>네이버 지도</strong>를 이용해 주세요.
+                    </>
+                  ) : (
+                    <>
+                      스마트폰에서 실행 시 <strong>네이버 지도</strong> 앱이
+                      열리며 위 경유지 전체가 순서대로 자동 입력됩니다.
+                    </>
+                  )}
                 </p>
               )}
 
@@ -3341,7 +3530,11 @@ export default function App() {
                       : 'bg-[#03C75A]'
                   }`}
                 >
-                  {naviGuideModal.appName} 앱 직접 열기
+                  {naviGuideModal.appKey === 'tmap'
+                    ? `${
+                        naviGuideModal.activeStopName || '1번 목적지'
+                      } TMAP 앱 직접 열기`
+                    : '네이버 지도 앱 직접 열기'}
                 </a>
                 <div className="flex gap-2">
                   {naviGuideModal.webUrl && (
