@@ -142,6 +142,74 @@ function getTrafficProfile(departMinutes) {
   return { multiplier: 1.25, avgSpeedKmh: 32, label: '주간 평균 주행' };
 }
 
+// --- [모바일 오프라인/지연 대비 한국 주요 시·구·권역 기본 좌표 사전] ---
+const KOREA_ADMIN_FALLBACK_COORDS = [
+  { keys: ['수지구', '풍덕천', '죽전', '상현', '성복', '동천'], lat: 37.3221, lng: 127.0977 },
+  { keys: ['기흥구', '구갈', '신갈', '보정', '영덕'], lat: 37.2752, lng: 127.1156 },
+  { keys: ['처인구', '김량장', '역북'], lat: 37.2343, lng: 127.2013 },
+  { keys: ['용인시', '용인'], lat: 37.2411, lng: 127.1775 },
+  { keys: ['분당구', '판교', '정자', '서현', '야탑', '수내'], lat: 37.3827, lng: 127.1189 },
+  { keys: ['성남시', '성남', '수정구', '중원구'], lat: 37.4201, lng: 127.1265 },
+  { keys: ['송파구', '잠실', '문정', '가락', '방이'], lat: 37.5145, lng: 127.1059 },
+  { keys: ['강남구', '역삼', '삼성', '테헤란', '선릉', '압구정'], lat: 37.5172, lng: 127.0473 },
+  { keys: ['서초구', '양재', '반포', '교대'], lat: 37.4837, lng: 127.0324 },
+  { keys: ['강동구', '천호', '길동', '고덕'], lat: 37.5301, lng: 127.1238 },
+  { keys: ['영등포구', '여의도', '당산', '문래'], lat: 37.5264, lng: 126.9255 },
+  { keys: ['중구', '을지로', '명동', '종로구', '광화문'], lat: 37.5641, lng: 126.9979 },
+  { keys: ['마포구', '상암', '공덕', '홍대'], lat: 37.5663, lng: 126.9019 },
+  { keys: ['구로구', '금천구', '가산', '구로디지털'], lat: 37.4813, lng: 126.8825 },
+  { keys: ['수원시', '영통', '팔달', '권선', '장안', '광교'], lat: 37.2636, lng: 127.0286 },
+  { keys: ['화성시', '동탄', '병점'], lat: 37.2006, lng: 127.0725 },
+  { keys: ['안양시', '평촌', '동안구', '만안구', '과천'], lat: 37.3943, lng: 126.9568 },
+  { keys: ['인천', '부평', '송도', '남동구'], lat: 37.4563, lng: 126.7052 },
+  { keys: ['고양시', '일산', '덕양'], lat: 37.6584, lng: 126.8320 },
+  { keys: ['전주시', '완산구', '덕진구'], lat: 35.8242, lng: 127.1479 },
+  { keys: ['대전', '유성구', '서구'], lat: 36.3504, lng: 127.3845 },
+  { keys: ['대구', '수성구', '달서구'], lat: 35.8714, lng: 128.6014 },
+  { keys: ['부산', '해운대', '서면'], lat: 35.1796, lng: 129.0756 },
+  { keys: ['광주광역시', '상무지구'], lat: 35.1595, lng: 126.8526 },
+];
+
+function getFallbackAdminCoords(text) {
+  const target = (text || '').trim();
+  if (!target) return null;
+  for (const entry of KOREA_ADMIN_FALLBACK_COORDS) {
+    if (entry.keys.some((k) => target.includes(k))) {
+      return { lat: entry.lat, lng: entry.lng };
+    }
+  }
+  return null;
+}
+
+// --- [PC ↔ 휴대폰 간 좌표/소요시간/상태 동기화를 위한 메모 메타데이터 파서] ---
+function parseKnowHowMeta(rawKnowHow) {
+  const text = rawKnowHow || '';
+  const match = text.match(/\s*\[META:(\{.*?\})\]\s*$/);
+  if (!match) {
+    return { cleanKnowHow: text.trim(), meta: {} };
+  }
+  try {
+    const meta = JSON.parse(match[1]);
+    return {
+      cleanKnowHow: text.replace(match[0], '').trim(),
+      meta: meta && typeof meta === 'object' ? meta : {},
+    };
+  } catch (e) {
+    return { cleanKnowHow: text.replace(match[0], '').trim(), meta: {} };
+  }
+}
+
+function buildKnowHowWithMeta(cleanKnowHow, metaObj) {
+  const base = (cleanKnowHow || '').trim();
+  const payload = JSON.stringify({
+    lat: Number(metaObj.lat) || 0,
+    lng: Number(metaObj.lng) || 0,
+    time: Number(metaObj.estimated_time) || 60,
+    status: metaObj.status || 'PENDING',
+  });
+  return base ? `${base}\n[META:${payload}]` : `[META:${payload}]`;
+}
+
 // --- [OSRM 실제 도로 경로 + 수도권 교통량 보정 이동시간 계산] ---
 async function calculateRealTravelInfo(fromPoint, toPoint, departMinutes, routeCache) {
   if (
@@ -185,7 +253,8 @@ async function calculateRealTravelInfo(fromPoint, toPoint, departMinutes, routeC
   } else {
     try {
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 2500);
+      // 모바일 통신망 지연을 고려해 타임아웃을 4.5초로 확보
+      const timeoutId = setTimeout(() => controller.abort(), 4500);
       const url = `https://router.project-osrm.org/route/v1/driving/${fromPoint.lng},${fromPoint.lat};${toPoint.lng},${toPoint.lat}?overview=false`;
       const res = await fetch(url, { signal: controller.signal });
       clearTimeout(timeoutId);
@@ -212,9 +281,11 @@ async function calculateRealTravelInfo(fromPoint, toPoint, departMinutes, routeC
     const parkingBuffer = roadDistanceKm < 2 ? 3 : 5;
     totalMins = baseDriveMins * traffic.multiplier + parkingBuffer;
   } else if (straightKm !== null) {
-    finalKm = straightKm * 1.35;
+    finalKm = straightKm * 1.32;
     const parkingBuffer = finalKm < 2 ? 3 : 5;
-    totalMins = (finalKm / traffic.avgSpeedKmh) * 60 + parkingBuffer;
+    // 10km 이상 구 간 이동 시 도시고속도로 평균 속도(44km/h) 반영해 과다 산출 방지
+    const effectiveSpeed = finalKm > 10 ? 44 : traffic.avgSpeedKmh;
+    totalMins = (finalKm / effectiveSpeed) * 60 + parkingBuffer;
   }
 
   const roundedMins = Math.max(5, Math.round(totalMins / 5) * 5);
@@ -372,21 +443,25 @@ export default function App() {
 
         const formatted = data.map((row) => {
           const cached = localCacheMap[row.name] || {};
+          const { cleanKnowHow, meta } = parseKnowHowMeta(row.know_how);
           return {
             id: row.id,
             name: row.name,
             type: row.type === 'QUARTERLY' ? 'QUARTERLY' : 'MONTHLY',
             address: row.address,
-            knowHow: row.know_how || '',
+            knowHow: cleanKnowHow,
             estimated_time:
-              Number(row.estimated_time) || cached.estimated_time || 60,
+              Number(row.estimated_time) ||
+              Number(meta.time) ||
+              cached.estimated_time ||
+              60,
             status: row.status
               ? row.status === 'COMPLETED'
                 ? 'COMPLETED'
                 : 'PENDING'
-              : cached.status || 'PENDING',
-            lat: Number(row.lat) || cached.lat || 0,
-            lng: Number(row.lng) || cached.lng || 0,
+              : meta.status || cached.status || 'PENDING',
+            lat: Number(row.lat) || Number(meta.lat) || cached.lat || 0,
+            lng: Number(row.lng) || Number(meta.lng) || cached.lng || 0,
           };
         });
         setClients(formatted);
@@ -552,11 +627,11 @@ export default function App() {
 
     const combined = [];
 
-    // ArcGIS 한국 지번/POI 결과 최우선 반영
+    // ArcGIS 한국 지번/POI 결과 최우선 반영 (한국 도로명 주소 점수 45점 이상 허용)
     arcgisResultsList.forEach((resData) => {
       const candidates = resData?.candidates || [];
       candidates.forEach((cand) => {
-        if (!cand?.location || (cand.score && cand.score < 70)) return;
+        if (!cand?.location || (cand.score && cand.score < 45)) return;
         const lat = parseFloat(cand.location.y);
         const lng = parseFloat(cand.location.x);
         const isKoreaBox =
@@ -783,160 +858,54 @@ export default function App() {
       }
     }
 
+    // 모든 외부 API가 모바일 망에서 지연/차단될 경우 내장 시·구·동 좌표로 보정
+    const fallbackAdmin =
+      getFallbackAdminCoords(cleanAddr) || getFallbackAdminCoords(fallbackName);
+    if (fallbackAdmin) {
+      return fallbackAdmin;
+    }
+
     return { lat: 0, lng: 0 };
   };
 
-  // --- [카카오/다음 공식 우편번호·건물명 검색기 로드 및 실행] ---
-  const openDaumPostcodeModal = (target, initialQuery = '') => {
-    setPostcodeInitialQuery((initialQuery || '').trim());
-    setPostcodeModalTarget(target);
-  };
-
-  useEffect(() => {
-    if (!postcodeModalTarget) return;
-
-    const renderPostcode = () => {
-      if (!window.daum || !window.daum.Postcode || !postcodeContainerRef.current) {
-        return;
-      }
-      postcodeContainerRef.current.innerHTML = '';
-      new window.daum.Postcode({
-        q: postcodeInitialQuery || undefined,
-        oncomplete: async (data) => {
-          const baseRoad = data.roadAddress || data.jibunAddress || '';
-          const bName = (data.buildingName || '').trim();
-          const formattedAddress = bName ? `${baseRoad} (${bName})` : baseRoad;
-
-          setPostcodeModalTarget(null);
-          showToast('좌표 변환 중...');
-
-          let coords = await resolveCoordinates(baseRoad, bName);
-          if ((!coords.lat || !coords.lng) && data.jibunAddress) {
-            coords = await resolveCoordinates(data.jibunAddress, bName);
-          }
-
-          if (postcodeModalTarget === 'client') {
-            if (bName) setNewName(bName);
-            setNewAddress(formattedAddress);
-            setNewCoords(coords);
-            setSearchResults([]);
-            setSearchKeyword('');
-            showToast('공식 주소와 GPS 좌표가 입력되었습니다.');
-          } else if (postcodeModalTarget === 'home') {
-            setHomeAddress(formattedAddress);
-            setHomeCoords(coords);
-            safeStorage.setItem('fieldops_home', formattedAddress);
-            safeStorage.setItem('fieldops_home_coords', JSON.stringify(coords));
-            setHomeSearchResults([]);
-            setHomeSearchQuery('');
-            showToast('자택 공식 주소와 GPS 좌표가 적용되었습니다.');
-          } else if (postcodeModalTarget === 'office') {
-            setOfficeAddress(formattedAddress);
-            setOfficeCoords(coords);
-            safeStorage.setItem('fieldops_office', formattedAddress);
-            safeStorage.setItem('fieldops_office_coords', JSON.stringify(coords));
-            setOfficeSearchResults([]);
-            setOfficeSearchQuery('');
-            showToast('회사 공식 주소와 GPS 좌표가 적용되었습니다.');
-          }
-        },
-        width: '100%',
-        height: '100%',
-      }).embed(postcodeContainerRef.current);
-    };
-
-    if (window.daum && window.daum.Postcode) {
-      renderPostcode();
-    } else {
-      const existingScript = document.getElementById('daum-postcode-script');
-      if (existingScript) {
-        existingScript.addEventListener('load', renderPostcode);
-      } else {
-        const script = document.createElement('script');
-        script.id = 'daum-postcode-script';
-        script.src =
-          'https://t1.daumcdn.net/mapjsapi/bundle/postcode/prod/postcode.v2.js';
-        script.async = true;
-        script.onload = renderPostcode;
-        script.onerror = () => {
-          setPostcodeModalTarget(null);
-          showToast('주소록 스크립트를 불러오지 못했습니다. 상단 검색창을 이용해 주세요.');
-        };
-        document.body.appendChild(script);
-      }
-    }
-  }, [postcodeModalTarget, postcodeInitialQuery]);
-
-  // --- [실시간 입력 디바운스 자동완성] ---
-  useEffect(() => {
-    const trimmed = searchKeyword.trim();
-    if (trimmed.length < 2) {
-      if (trimmed.length === 0) setSearchResults([]);
-      return;
-    }
-    const timer = setTimeout(async () => {
-      setIsSearching(true);
-      try {
-        const data = await queryFlexiblePlaces(trimmed);
-        setSearchResults(data);
-      } finally {
-        setIsSearching(false);
-      }
-    }, 380);
-    return () => clearTimeout(timer);
-  }, [searchKeyword]);
-
-  useEffect(() => {
-    const trimmed = homeSearchQuery.trim();
-    if (trimmed.length < 2) {
-      if (trimmed.length === 0) setHomeSearchResults([]);
-      return;
-    }
-    const timer = setTimeout(async () => {
-      setIsSearchingHome(true);
-      try {
-        const data = await queryFlexiblePlaces(trimmed);
-        setHomeSearchResults(data);
-      } finally {
-        setIsSearchingHome(false);
-      }
-    }, 380);
-    return () => clearTimeout(timer);
-  }, [homeSearchQuery]);
-
-  useEffect(() => {
-    const trimmed = officeSearchQuery.trim();
-    if (trimmed.length < 2) {
-      if (trimmed.length === 0) setOfficeSearchResults([]);
-      return;
-    }
-    const timer = setTimeout(async () => {
-      setIsSearchingOffice(true);
-      try {
-        const data = await queryFlexiblePlaces(trimmed);
-        setOfficeSearchResults(data);
-      } finally {
-        setIsSearchingOffice(false);
-      }
-    }, 380);
-    return () => clearTimeout(timer);
-  }, [officeSearchQuery]);
-
-  // --- [2-A. 고객 등록 장소 검색] ---
-  const handlePlaceSearch = async (e) => {
-    e.preventDefault();
-    if (!searchKeyword.trim()) return;
-    setIsSearching(true);
+  // --- [DB에 좌표 및 메타데이터 백그라운드 동기화 (PC ↔ 휴대폰 공유)] ---
+  const syncClientRecordToDb = async (clientObj) => {
+    if (!isDbConnected || !clientObj?.id) return;
     try {
-      const data = await queryFlexiblePlaces(searchKeyword);
-      setSearchResults(data);
-      if (data.length === 0) {
-        openDaumPostcodeModal('client', searchKeyword);
+      const res = await fetch(
+        `${SUPABASE_URL}/rest/v1/clients?id=eq.${clientObj.id}`,
+        {
+          method: 'PATCH',
+          headers: {
+            apikey: SUPABASE_ANON_KEY,
+            Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            lat: clientObj.lat,
+            lng: clientObj.lng,
+            estimated_time: clientObj.estimated_time,
+            status: clientObj.status,
+          }),
+        }
+      );
+
+      // 확장 컬럼이 없는 DB 스키마인 경우 know_how 메타데이터로 좌표 동기화
+      if (!res.ok) {
+        await fetch(`${SUPABASE_URL}/rest/v1/clients?id=eq.${clientObj.id}`, {
+          method: 'PATCH',
+          headers: {
+            apikey: SUPABASE_ANON_KEY,
+            Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            know_how: buildKnowHowWithMeta(clientObj.knowHow, clientObj),
+          }),
+        });
       }
-    } catch (error) {
-      showToast('장소 검색 중 네트워크 오류가 발생했습니다.');
-    } finally {
-      setIsSearching(false);
+    } catch (e) {
+      // 동기화 실패 시 로컬 유지
     }
   };
 
@@ -1080,7 +1049,10 @@ export default function App() {
               name: newClientObj.name,
               type: newClientObj.type,
               address: newClientObj.address,
-              know_how: newClientObj.knowHow,
+              know_how: buildKnowHowWithMeta(
+                newClientObj.knowHow,
+                newClientObj
+              ),
             }),
           });
         }
@@ -1125,8 +1097,9 @@ export default function App() {
     }
 
     if (isDbConnected) {
+      const targetClient = updated.find((c) => c.id === id);
       try {
-        await fetch(`${SUPABASE_URL}/rest/v1/clients?id=eq.${id}`, {
+        const res = await fetch(`${SUPABASE_URL}/rest/v1/clients?id=eq.${id}`, {
           method: 'PATCH',
           headers: {
             apikey: SUPABASE_ANON_KEY,
@@ -1135,6 +1108,9 @@ export default function App() {
           },
           body: JSON.stringify({ status: newStatus }),
         });
+        if (!res.ok && targetClient) {
+          await syncClientRecordToDb(targetClient);
+        }
       } catch (err) {
         // DB 컬럼 미생성 시 무시
       }
@@ -1346,6 +1322,7 @@ export default function App() {
             saveLocalClients(next);
             return next;
           });
+          syncClientRecordToDb(seedClient);
         }
       }
 
@@ -1395,6 +1372,7 @@ export default function App() {
             );
             if (resolved.lat && resolved.lng) {
               updatedCand = { ...updatedCand, ...resolved };
+              syncClientRecordToDb(updatedCand);
             }
           }
 
@@ -1417,10 +1395,11 @@ export default function App() {
         })
       );
 
+      // 수도권 인접 권역(용인 수지 ↔ 송파 잠실 등 30km 이내) 안정적 포함
       const sameZoneCandidates = enrichedCandidates
         .filter((cand) => {
           if (cand.distKm !== null) {
-            return cand.distKm <= 25;
+            return cand.distKm <= 30;
           }
           return cand.simScore > 0;
         })
