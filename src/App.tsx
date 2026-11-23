@@ -25,6 +25,8 @@ import {
   Sparkles,
   Briefcase,
   Car,
+  ExternalLink,
+  Eye,
 } from 'lucide-react';
 
 // --- [Supabase 클라우드 DB 설정] ---
@@ -98,7 +100,7 @@ const INITIAL_CLIENTS = [
   },
 ];
 
-// --- [두 좌표 간 직선 거리(km) 계산 (Haversine)] ---
+// --- [두 좌표 간 직선 거리(km) 계산 (Haversine 공식)] ---
 function getDistanceKm(lat1, lng1, lat2, lng2) {
   if (!lat1 || !lng1 || !lat2 || !lng2) return null;
   const R = 6371;
@@ -239,7 +241,8 @@ export default function App() {
   const [plannedVisits, setPlannedVisits] = useState([]);
   const [optimizationNote, setOptimizationNote] = useState('');
   const [autoFillMorningGap, setAutoFillMorningGap] = useState(true);
-  const [includeOriginInNavi, setIncludeOriginInNavi] = useState(true);
+  // 스마트폰 실주행 시 기본값은 '현재 GPS 위치에서 출발'이 경유지 인식률이 가장 높음
+  const [includeOriginInNavi, setIncludeOriginInNavi] = useState(false);
 
   // 자택 / 회사 환경설정 (주소 + 좌표)
   const [homeAddress, setHomeAddress] = useState(
@@ -276,6 +279,11 @@ export default function App() {
   const [officeSearchQuery, setOfficeSearchQuery] = useState('');
   const [officeSearchResults, setOfficeSearchResults] = useState([]);
   const [isSearchingOffice, setIsSearchingOffice] = useState(false);
+
+  // 카카오/다음 공식 주소·건물명 검색 모달 상태 ('client' | 'home' | 'office' | null)
+  const [postcodeModalTarget, setPostcodeModalTarget] = useState(null);
+  const [postcodeInitialQuery, setPostcodeInitialQuery] = useState('');
+  const postcodeContainerRef = useRef(null);
 
   // 출/퇴근(직출/직퇴) 옵션
   const [startPoint, setStartPoint] = useState('HOME');
@@ -399,47 +407,531 @@ export default function App() {
     fetchClients();
   }, []);
 
-  // --- [공통 OpenStreetMap 장소 검색 함수] ---
-  const queryNominatimPlaces = async (keyword) => {
-    const encoded = encodeURIComponent(keyword.trim());
-    const response = await fetch(
-      `https://nominatim.openstreetmap.org/search?format=json&q=${encoded}&countrycodes=kr&limit=5&accept-language=ko`
-    );
-    if (!response.ok) throw new Error('검색 응답 오류');
-    const data = await response.json();
-    return Array.isArray(data) ? data : [];
+  // --- [한국 행정구역 약칭 보정 (지오코딩 정확도 향상)] ---
+  const normalizeKoreanAdminPrefix = (text) => {
+    const map = {
+      '서울 ': '서울특별시 ',
+      '경기 ': '경기도 ',
+      '인천 ': '인천광역시 ',
+      '부산 ': '부산광역시 ',
+      '대구 ': '대구광역시 ',
+      '대전 ': '대전광역시 ',
+      '광주 ': '광주광역시 ',
+      '울산 ': '울산광역시 ',
+      '세종 ': '세종특별자치시 ',
+      '강원 ': '강원특별자치도 ',
+      '충북 ': '충청북도 ',
+      '충남 ': '충청남도 ',
+      '전북 ': '전북특별자치도 ',
+      '전남 ': '전라남도 ',
+      '경북 ': '경상북도 ',
+      '경남 ': '경상남도 ',
+      '제주 ': '제주특별자치도 ',
+    };
+    let result = text.trim();
+    Object.keys(map).forEach((shortKey) => {
+      if (result.startsWith(shortKey)) {
+        result = map[shortKey] + result.slice(shortKey.length);
+      }
+    });
+    return result;
   };
 
-  // --- [좌표 누락 장소 자동 지오코딩] ---
-  const resolveCoordinates = async (addressText, fallbackName = '') => {
+  // --- [기업명/건물명 접미사 보정 (예: "한국투자증권 본사" -> "한국투자증권")] ---
+  const stripKoreanOrgSuffix = (text) => {
+    return text
+      .replace(
+        /\s*(본사|본점|사옥|지점|영업점|출장소|연구소|물류센터|고객센터|센터)\s*$/g,
+        ''
+      )
+      .trim();
+  };
+
+  // --- [지번 주소 패턴 판별 (예: "여의도동 27-1", "역삼동 123-4")] ---
+  const isKoreanJibunQuery = (text) => {
+    return /[가-힣0-9]+(동|읍|면|리|가)\s*\d+(-\d+)?/.test(text);
+  };
+
+  // --- [영문 국가/불필요 접미사 제거 및 한국어 주소 정제] ---
+  const cleanKoreanAddressText = (text) => {
+    return (text || '')
+      .replace(/,?\s*(KOR|South Korea|Republic of Korea|대한민국)\s*/gi, '')
+      .replace(/\s*,\s*/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  };
+
+  // --- [좌표 기반 한국어 공식 주소 역지오코딩 보정] ---
+  const reverseGeocodeToKorean = async (lat, lng) => {
     try {
-      let results = await queryNominatimPlaces(addressText);
-      if (results.length === 0 && fallbackName) {
-        results = await queryNominatimPlaces(fallbackName);
+      const res = await fetch(
+        `https://geocode.arcgis.com/arcgis/rest/services/World/GeocodeServer/reverseGeocode?location=${lng},${lat}&langCode=ko&f=json`
+      );
+      if (!res.ok) return null;
+      const data = await res.json();
+      const addrObj = data?.address;
+      if (!addrObj) return null;
+      const koAddr = cleanKoreanAddressText(
+        addrObj.Match_addr || addrObj.LongLabel || addrObj.Address || ''
+      );
+      return /[가-힣]/.test(koAddr) ? koAddr : null;
+    } catch (e) {
+      return null;
+    }
+  };
+
+  // --- [한국 지번·도로명·기업명 다중 엔진 통합 검색 (ArcGIS KOR + Photon + Nominatim)] ---
+  const queryFlexiblePlaces = async (keyword) => {
+    const raw = keyword.trim();
+    if (!raw) return [];
+
+    const normalized = normalizeKoreanAdminPrefix(raw);
+    const coreOrgName = stripKoreanOrgSuffix(normalized);
+    const isJibun = isKoreanJibunQuery(normalized);
+    const tokens = raw.split(/\s+/).filter(Boolean);
+    const lastToken = tokens.length > 1 ? tokens[tokens.length - 1] : null;
+
+    // 1) ArcGIS 한국 지오코더 (langCode=ko 적용으로 한국어 주소 반환)
+    const arcgisQueries = [normalized];
+    if (coreOrgName && coreOrgName !== normalized && coreOrgName.length >= 2) {
+      arcgisQueries.push(coreOrgName);
+    }
+
+    const arcgisRequests = arcgisQueries.map((q) =>
+      fetch(
+        `https://geocode.arcgis.com/arcgis/rest/services/World/GeocodeServer/findAddressCandidates?SingleLine=${encodeURIComponent(
+          q
+        )}&countryCode=KOR&langCode=ko&outFields=PlaceName,Place_addr,Match_addr,Type&maxLocations=6&f=json`
+      )
+        .then((r) => (r.ok ? r.json() : { candidates: [] }))
+        .catch(() => ({ candidates: [] }))
+    );
+
+    // 2) Photon(lang=default로 현지 한국어 태그 우선) & Nominatim 보조 검색
+    const osmTargetQuery = isJibun
+      ? normalized.replace(/\s*\d+(-\d+)?\s*$/, '').trim()
+      : coreOrgName || normalized;
+
+    const osmRequests = [
+      fetch(
+        `https://photon.komoot.io/api/?q=${encodeURIComponent(
+          osmTargetQuery
+        )}&lang=default&limit=6&lat=37.5665&lon=126.9780`
+      )
+        .then((r) => (r.ok ? r.json() : { features: [] }))
+        .catch(() => ({ features: [] })),
+
+      fetch(
+        `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(
+          osmTargetQuery
+        )}&countrycodes=kr&limit=5&accept-language=ko&addressdetails=1`
+      )
+        .then((r) => (r.ok ? r.json() : []))
+        .catch(() => []),
+    ];
+
+    if (!isJibun && lastToken && lastToken.length >= 2) {
+      const strippedLast = stripKoreanOrgSuffix(lastToken);
+      if (strippedLast.length >= 2) {
+        osmRequests.push(
+          fetch(
+            `https://photon.komoot.io/api/?q=${encodeURIComponent(
+              strippedLast
+            )}&lang=default&limit=5&lat=37.5665&lon=126.9780`
+          )
+            .then((r) => (r.ok ? r.json() : { features: [] }))
+            .catch(() => ({ features: [] }))
+        );
       }
-      if (results.length > 0) {
+    }
+
+    const [arcgisResultsList, osmResultsList] = await Promise.all([
+      Promise.all(arcgisRequests),
+      Promise.all(osmRequests),
+    ]);
+
+    const combined = [];
+
+    // ArcGIS 한국 지번/POI 결과 최우선 반영
+    arcgisResultsList.forEach((resData) => {
+      const candidates = resData?.candidates || [];
+      candidates.forEach((cand) => {
+        if (!cand?.location || (cand.score && cand.score < 70)) return;
+        const lat = parseFloat(cand.location.y);
+        const lng = parseFloat(cand.location.x);
+        const isKoreaBox =
+          lat >= 33.0 && lat <= 38.9 && lng >= 124.5 && lng <= 132.0;
+        if (!isKoreaBox) return;
+
+        const attrs = cand.attributes || {};
+        const fullAddr = cleanKoreanAddressText(
+          attrs.Place_addr || attrs.Match_addr || cand.address || raw
+        );
+        const rawPlaceName = cleanKoreanAddressText(attrs.PlaceName || '');
+
+        const displayTitle =
+          rawPlaceName ||
+          (cand.address && cleanKoreanAddressText(cand.address) !== fullAddr
+            ? cleanKoreanAddressText(cand.address)
+            : raw);
+
+        combined.push({
+          name: displayTitle,
+          display_name:
+            rawPlaceName && !fullAddr.includes(rawPlaceName)
+              ? `${fullAddr} (${rawPlaceName})`
+              : fullAddr,
+          lat,
+          lon: lng,
+          sourcePriority: 1,
+        });
+      });
+    });
+
+    const [photonPrimary, nominatimData, photonFallback] = osmResultsList;
+
+    const allPhotonFeatures = [
+      ...(photonPrimary?.features || []),
+      ...(photonFallback?.features || []),
+    ];
+
+    allPhotonFeatures.forEach((feat) => {
+      const coords = feat?.geometry?.coordinates;
+      const props = feat?.properties || {};
+      if (!coords || coords.length < 2) return;
+
+      const lng = parseFloat(coords[0]);
+      const lat = parseFloat(coords[1]);
+      const isKoreaBox = lat >= 33.0 && lat <= 38.9 && lng >= 124.5 && lng <= 132.0;
+      if (props.countrycode && props.countrycode !== 'KR' && !isKoreaBox) return;
+      if (!isKoreaBox) return;
+
+      const addrParts = [
+        props.state,
+        props.city || props.county,
+        props.district || props.suburb || props.locality,
+        props.street,
+        props.housenumber,
+      ].filter(Boolean);
+
+      const placeName =
+        props.name ||
+        [props.street, props.housenumber].filter(Boolean).join(' ') ||
+        addrParts[addrParts.length - 1] ||
+        raw;
+
+      const fullAddress = cleanKoreanAddressText(
+        addrParts.length > 0
+          ? `${addrParts.join(' ')}${
+              props.name && !addrParts.includes(props.name)
+                ? ` (${props.name})`
+                : ''
+            }`
+          : placeName
+      );
+
+      combined.push({
+        name: cleanKoreanAddressText(placeName),
+        display_name: fullAddress,
+        lat,
+        lon: lng,
+        sourcePriority: 2,
+      });
+    });
+
+    if (Array.isArray(nominatimData)) {
+      nominatimData.forEach((item) => {
+        const addr = item.address || {};
+        const structuredKoParts = [
+          addr.province || addr.state,
+          addr.city || addr.county,
+          addr.borough || addr.district || addr.suburb || addr.quarter || addr.neighbourhood,
+          addr.road,
+          addr.house_number,
+        ].filter(Boolean);
+
+        const placeName = cleanKoreanAddressText(
+          item.name || item.display_name.split(',')[0].trim()
+        );
+        const fallbackDisplay = item.display_name
+          .split(',')
+          .map((s) => s.trim())
+          .filter((s) => s !== '대한민국' && !/^\d{5}$/.test(s))
+          .reverse()
+          .join(' ');
+
+        const cleanDisplay = cleanKoreanAddressText(
+          structuredKoParts.length >= 2
+            ? structuredKoParts.join(' ')
+            : fallbackDisplay || item.display_name
+        );
+
+        combined.push({
+          name: placeName,
+          display_name: cleanDisplay,
+          lat: parseFloat(item.lat),
+          lon: parseFloat(item.lon),
+          sourcePriority: 2,
+        });
+      });
+    }
+
+    const unique = [];
+    combined.forEach((item) => {
+      if (!item.lat || !item.lon) return;
+      const isDup = unique.some((existing) => {
+        const dist = getDistanceKm(
+          existing.lat,
+          existing.lon,
+          item.lat,
+          item.lon
+        );
+        return (
+          existing.display_name === item.display_name ||
+          (existing.name === item.name && dist !== null && dist < 0.08)
+        );
+      });
+      if (!isDup) {
+        unique.push(item);
+      }
+    });
+
+    unique.sort((a, b) => {
+      const aHasKo = /[가-힣]/.test(a.display_name) ? 1 : 0;
+      const bHasKo = /[가-힣]/.test(b.display_name) ? 1 : 0;
+      if (bHasKo !== aHasKo) return bHasKo - aHasKo;
+
+      if (tokens.length > 1 && !isJibun) {
+        const regionTokens = tokens.slice(0, tokens.length - 1);
+        const scoreA = regionTokens.reduce(
+          (acc, t) => acc + (a.display_name.includes(t) ? 1 : 0),
+          0
+        );
+        const scoreB = regionTokens.reduce(
+          (acc, t) => acc + (b.display_name.includes(t) ? 1 : 0),
+          0
+        );
+        if (scoreB !== scoreA) return scoreB - scoreA;
+      }
+
+      return (a.sourcePriority || 2) - (b.sourcePriority || 2);
+    });
+
+    // 영문으로 남아있는 결과가 있다면 좌표 기반 한국어 주소로 자동 변환
+    const topCandidates = unique.slice(0, 8);
+    const localizedResults = await Promise.all(
+      topCandidates.map(async (item) => {
+        const hasEnglishLetters = /[a-zA-Z]{3,}/.test(item.display_name);
+        const hasKorean = /[가-힣]/.test(item.display_name);
+        if (!hasKorean || hasEnglishLetters) {
+          const koAddr = await reverseGeocodeToKorean(item.lat, item.lon);
+          if (koAddr) {
+            const koName = /[가-힣]/.test(item.name)
+              ? item.name
+              : koAddr.split(' ').slice(-2).join(' ');
+            return {
+              ...item,
+              name: koName,
+              display_name:
+                koName && !koAddr.includes(koName)
+                  ? `${koAddr} (${koName})`
+                  : koAddr,
+            };
+          }
+        }
+        return item;
+      })
+    );
+
+    return localizedResults;
+  };
+
+  // --- [다단계 한국 주소/건물 좌표 변환기 (지오코딩)] ---
+  const resolveCoordinates = async (addressText, fallbackName = '') => {
+    const cleanAddr = normalizeKoreanAdminPrefix(
+      (addressText || '').replace(/\([^)]*\)/g, '').trim()
+    );
+    const cleanName = stripKoreanOrgSuffix((fallbackName || '').trim());
+
+    const candidatesToTry = [];
+    if (cleanAddr) candidatesToTry.push(cleanAddr);
+    if (fallbackName && fallbackName.trim()) {
+      candidatesToTry.push(`${cleanAddr} ${fallbackName.trim()}`.trim());
+      candidatesToTry.push(fallbackName.trim());
+    }
+    if (cleanName && cleanName !== fallbackName.trim()) {
+      candidatesToTry.push(`${cleanAddr} ${cleanName}`.trim());
+      candidatesToTry.push(cleanName);
+    }
+
+    const addrParts = cleanAddr.split(/\s+/);
+    if (addrParts.length >= 3) {
+      candidatesToTry.push(addrParts.slice(0, 3).join(' '));
+    }
+    if (addrParts.length >= 2) {
+      candidatesToTry.push(addrParts.slice(0, 2).join(' '));
+    }
+
+    for (const query of candidatesToTry) {
+      if (!query) continue;
+      const results = await queryFlexiblePlaces(query);
+      if (results.length > 0 && results[0].lat && results[0].lon) {
         return {
           lat: parseFloat(results[0].lat) || 0,
           lng: parseFloat(results[0].lon) || 0,
         };
       }
-    } catch (e) {
-      // 지오코딩 실패 시 0 반환
     }
+
     return { lat: 0, lng: 0 };
   };
+
+  // --- [카카오/다음 공식 우편번호·건물명 검색기 로드 및 실행] ---
+  const openDaumPostcodeModal = (target, initialQuery = '') => {
+    setPostcodeInitialQuery((initialQuery || '').trim());
+    setPostcodeModalTarget(target);
+  };
+
+  useEffect(() => {
+    if (!postcodeModalTarget) return;
+
+    const renderPostcode = () => {
+      if (!window.daum || !window.daum.Postcode || !postcodeContainerRef.current) {
+        return;
+      }
+      postcodeContainerRef.current.innerHTML = '';
+      new window.daum.Postcode({
+        q: postcodeInitialQuery || undefined,
+        oncomplete: async (data) => {
+          const baseRoad = data.roadAddress || data.jibunAddress || '';
+          const bName = (data.buildingName || '').trim();
+          const formattedAddress = bName ? `${baseRoad} (${bName})` : baseRoad;
+
+          setPostcodeModalTarget(null);
+          showToast('좌표 변환 중...');
+
+          let coords = await resolveCoordinates(baseRoad, bName);
+          if ((!coords.lat || !coords.lng) && data.jibunAddress) {
+            coords = await resolveCoordinates(data.jibunAddress, bName);
+          }
+
+          if (postcodeModalTarget === 'client') {
+            if (bName) setNewName(bName);
+            setNewAddress(formattedAddress);
+            setNewCoords(coords);
+            setSearchResults([]);
+            setSearchKeyword('');
+            showToast('공식 주소와 GPS 좌표가 입력되었습니다.');
+          } else if (postcodeModalTarget === 'home') {
+            setHomeAddress(formattedAddress);
+            setHomeCoords(coords);
+            safeStorage.setItem('fieldops_home', formattedAddress);
+            safeStorage.setItem('fieldops_home_coords', JSON.stringify(coords));
+            setHomeSearchResults([]);
+            setHomeSearchQuery('');
+            showToast('자택 공식 주소와 GPS 좌표가 적용되었습니다.');
+          } else if (postcodeModalTarget === 'office') {
+            setOfficeAddress(formattedAddress);
+            setOfficeCoords(coords);
+            safeStorage.setItem('fieldops_office', formattedAddress);
+            safeStorage.setItem('fieldops_office_coords', JSON.stringify(coords));
+            setOfficeSearchResults([]);
+            setOfficeSearchQuery('');
+            showToast('회사 공식 주소와 GPS 좌표가 적용되었습니다.');
+          }
+        },
+        width: '100%',
+        height: '100%',
+      }).embed(postcodeContainerRef.current);
+    };
+
+    if (window.daum && window.daum.Postcode) {
+      renderPostcode();
+    } else {
+      const existingScript = document.getElementById('daum-postcode-script');
+      if (existingScript) {
+        existingScript.addEventListener('load', renderPostcode);
+      } else {
+        const script = document.createElement('script');
+        script.id = 'daum-postcode-script';
+        script.src =
+          'https://t1.daumcdn.net/mapjsapi/bundle/postcode/prod/postcode.v2.js';
+        script.async = true;
+        script.onload = renderPostcode;
+        script.onerror = () => {
+          setPostcodeModalTarget(null);
+          showToast('주소록 스크립트를 불러오지 못했습니다. 상단 검색창을 이용해 주세요.');
+        };
+        document.body.appendChild(script);
+      }
+    }
+  }, [postcodeModalTarget, postcodeInitialQuery]);
+
+  // --- [실시간 입력 디바운스 자동완성] ---
+  useEffect(() => {
+    const trimmed = searchKeyword.trim();
+    if (trimmed.length < 2) {
+      if (trimmed.length === 0) setSearchResults([]);
+      return;
+    }
+    const timer = setTimeout(async () => {
+      setIsSearching(true);
+      try {
+        const data = await queryFlexiblePlaces(trimmed);
+        setSearchResults(data);
+      } finally {
+        setIsSearching(false);
+      }
+    }, 380);
+    return () => clearTimeout(timer);
+  }, [searchKeyword]);
+
+  useEffect(() => {
+    const trimmed = homeSearchQuery.trim();
+    if (trimmed.length < 2) {
+      if (trimmed.length === 0) setHomeSearchResults([]);
+      return;
+    }
+    const timer = setTimeout(async () => {
+      setIsSearchingHome(true);
+      try {
+        const data = await queryFlexiblePlaces(trimmed);
+        setHomeSearchResults(data);
+      } finally {
+        setIsSearchingHome(false);
+      }
+    }, 380);
+    return () => clearTimeout(timer);
+  }, [homeSearchQuery]);
+
+  useEffect(() => {
+    const trimmed = officeSearchQuery.trim();
+    if (trimmed.length < 2) {
+      if (trimmed.length === 0) setOfficeSearchResults([]);
+      return;
+    }
+    const timer = setTimeout(async () => {
+      setIsSearchingOffice(true);
+      try {
+        const data = await queryFlexiblePlaces(trimmed);
+        setOfficeSearchResults(data);
+      } finally {
+        setIsSearchingOffice(false);
+      }
+    }, 380);
+    return () => clearTimeout(timer);
+  }, [officeSearchQuery]);
 
   // --- [2-A. 고객 등록 장소 검색] ---
   const handlePlaceSearch = async (e) => {
     e.preventDefault();
     if (!searchKeyword.trim()) return;
     setIsSearching(true);
-    setSearchResults([]);
     try {
-      const data = await queryNominatimPlaces(searchKeyword);
+      const data = await queryFlexiblePlaces(searchKeyword);
       setSearchResults(data);
       if (data.length === 0) {
-        showToast('검색 결과가 없습니다. 다른 키워드로 검색해 보세요.');
+        openDaumPostcodeModal('client', searchKeyword);
       }
     } catch (error) {
       showToast('장소 검색 중 네트워크 오류가 발생했습니다.');
@@ -465,12 +957,11 @@ export default function App() {
     e.preventDefault();
     if (!homeSearchQuery.trim()) return;
     setIsSearchingHome(true);
-    setHomeSearchResults([]);
     try {
-      const data = await queryNominatimPlaces(homeSearchQuery);
+      const data = await queryFlexiblePlaces(homeSearchQuery);
       setHomeSearchResults(data);
       if (data.length === 0) {
-        showToast('자택 검색 결과가 없습니다. 도로명이나 아파트명으로 검색해 보세요.');
+        openDaumPostcodeModal('home', homeSearchQuery);
       }
     } catch (error) {
       showToast('자택 주소 검색 중 오류가 발생했습니다.');
@@ -497,12 +988,11 @@ export default function App() {
     e.preventDefault();
     if (!officeSearchQuery.trim()) return;
     setIsSearchingOffice(true);
-    setOfficeSearchResults([]);
     try {
-      const data = await queryNominatimPlaces(officeSearchQuery);
+      const data = await queryFlexiblePlaces(officeSearchQuery);
       setOfficeSearchResults(data);
       if (data.length === 0) {
-        showToast('회사 검색 결과가 없습니다. 건물명이나 도로명으로 검색해 보세요.');
+        openDaumPostcodeModal('office', officeSearchQuery);
       }
     } catch (error) {
       showToast('회사 주소 검색 중 오류가 발생했습니다.');
@@ -525,7 +1015,7 @@ export default function App() {
     showToast('회사 주소와 GPS 좌표가 적용되었습니다.');
   };
 
-  // --- [3. 새 고객사 저장 (DB 스키마 호환 + 좌표 자동 보완)] ---
+  // --- [3. 새 고객사 저장] ---
   const handleAddClient = async (e) => {
     e.preventDefault();
     if (!newName.trim() || !newAddress.trim()) {
@@ -557,7 +1047,6 @@ export default function App() {
 
     if (isDbConnected) {
       try {
-        // 1차 시도: 전체 확장 컬럼 포함 저장
         let res = await fetch(`${SUPABASE_URL}/rest/v1/clients`, {
           method: 'POST',
           headers: {
@@ -578,7 +1067,6 @@ export default function App() {
           }),
         });
 
-        // 2차 폴백: 확장 컬럼 미추가 시 기본 컬럼으로 저장
         if (!res.ok) {
           res = await fetch(`${SUPABASE_URL}/rest/v1/clients`, {
             method: 'POST',
@@ -608,7 +1096,7 @@ export default function App() {
           }
         }
       } catch (err) {
-        // 네트워크 실패 시에도 로컬에 이미 저장됨
+        // 네트워크 실패 시 로컬 유지
       }
     }
 
@@ -943,12 +1431,12 @@ export default function App() {
           return b.simScore - a.simScore;
         });
 
-      const OFFICE_EARLIEST_DEPART = 9 * 60; // 09:00 회사 가장 빠른 출발 기준
-      const DIRECT_ARRIVE_MIN = 9 * 60 + 30; // 09:30 직출 최소 도착 목표
-      const DIRECT_ARRIVE_MAX = 10 * 60; // 10:00 직출 최대 도착 목표
-      const LUNCH_START = 11 * 60 + 30; // 11:30 점심 시작
-      const LUNCH_END = 13 * 60; // 13:00 점심 종료
-      const DAY_END = 17 * 60 + 30; // 17:30 일과 종료
+      const OFFICE_EARLIEST_DEPART = 9 * 60;
+      const DIRECT_ARRIVE_MIN = 9 * 60 + 30;
+      const DIRECT_ARRIVE_MAX = 10 * 60;
+      const LUNCH_START = 11 * 60 + 30;
+      const LUNCH_END = 13 * 60;
+      const DAY_END = 17 * 60 + 30;
 
       const originPoint =
         overrideStart === 'HOME'
@@ -972,7 +1460,6 @@ export default function App() {
       let splitSummaryNotes = [];
       let note = '';
 
-      // [단계 1-A: 자택 출발(직출) -> 첫 고객사 09:30~10:00 도착 기준 역산]
       if (overrideStart === 'HOME') {
         const earliestDirectFinish = DIRECT_ARRIVE_MIN + firstWork;
         let morningFitClient = null;
@@ -1140,7 +1627,6 @@ export default function App() {
           }
         }
       } else {
-        // [단계 1-B: 회사 출발(출근) -> 가장 빠른 출발 09:00 이후 기준]
         const earliestArrival = OFFICE_EARLIEST_DEPART + firstTravel;
         const earliestFinish = earliestArrival + firstWork;
 
@@ -1373,7 +1859,7 @@ export default function App() {
         }
       }
 
-      // [단계 2: 점심시간(11:30~13:00) 삽입 및 오후 추가 고객사 실이동시간 반영 배정]
+      // [단계 2: 점심시간(11:30~13:00) 삽입 및 오후 추가 고객사 배정]
       const remainingAfternoonPool = sameZoneCandidates.filter(
         (c) => !usedIds.has(c.id)
       );
@@ -1520,17 +2006,17 @@ export default function App() {
     }
   };
 
-  // --- [7. TMAP / 네이버 지도 다중 경유지 길안내 실행 (출발지·경유지·복귀지 전체 반영)] ---
-  const buildFullNaviStops = () => {
+  // --- [7. TMAP / 네이버 지도 다중 경유지 길안내 URL 생성 (동기식 즉시 실행)] ---
+  const buildNaviPayload = (app) => {
     const startItem = dailySchedule.find((item) => item.type === 'START');
     const endItem = dailySchedule.find((item) => item.type === 'END');
 
-    const visitStops = [];
+    const rawVisits = [];
     const seenIds = new Set();
     dailySchedule.forEach((item) => {
       if (item.type === 'VISIT' && item.client && !seenIds.has(item.client.id)) {
         seenIds.add(item.client.id);
-        visitStops.push({
+        rawVisits.push({
           id: `visit-${item.client.id}`,
           name: item.client.name,
           address: item.client.address,
@@ -1540,7 +2026,19 @@ export default function App() {
       }
     });
 
-    const originStop =
+    // 유효 좌표(lat/lng != 0) 필터링 및 초근접(50m 이내) 중복 지점 정리
+    const validVisits = [];
+    rawVisits.forEach((stop) => {
+      if (!stop.lat || !stop.lng) return;
+      const prev = validVisits[validVisits.length - 1];
+      if (prev) {
+        const dist = getDistanceKm(prev.lat, prev.lng, stop.lat, stop.lng);
+        if (dist !== null && dist < 0.05) return;
+      }
+      validVisits.push(stop);
+    });
+
+    const rawOrigin =
       includeOriginInNavi && startItem
         ? {
             id: 'origin-start',
@@ -1557,7 +2055,7 @@ export default function App() {
           }
         : null;
 
-    const destStop = endItem
+    const rawDest = endItem
       ? {
           id: 'dest-end',
           name: endItem.naviName || endItem.title,
@@ -1573,115 +2071,152 @@ export default function App() {
         }
       : null;
 
-    return { originStop, visitStops, destStop };
-  };
-
-  const launchMultiNavi = async (app) => {
-    const { originStop, visitStops, destStop } = buildFullNaviStops();
-
-    if (visitStops.length === 0) {
-      showToast('안내할 방문 일정이 없습니다.');
-      return;
-    }
-
-    // 좌표가 비어있는 지점이 있다면 전송 직전 자동 보정
-    const ensureCoords = async (stop) => {
-      if (!stop) return null;
-      if (stop.lat && stop.lng) return stop;
-      const resolved = await resolveCoordinates(stop.address, stop.name);
-      return {
-        ...stop,
-        lat: resolved.lat || 0,
-        lng: resolved.lng || 0,
-      };
-    };
-
-    const resolvedOrigin = await ensureCoords(originStop);
-    const resolvedVisits = await Promise.all(visitStops.map(ensureCoords));
-    const resolvedDest = await ensureCoords(destStop);
-
-    // 출발지 / 경유지 / 최종 도착지 구조화
-    let startNode = resolvedOrigin;
     let waypointNodes = [];
-    let finalDestNode = resolvedDest;
+    let finalDestNode = null;
 
-    if (resolvedDest) {
-      waypointNodes = [...resolvedVisits];
-      finalDestNode = resolvedDest;
-    } else {
-      waypointNodes = resolvedVisits.slice(0, resolvedVisits.length - 1);
-      finalDestNode = resolvedVisits[resolvedVisits.length - 1];
+    if (rawDest && rawDest.lat && rawDest.lng) {
+      waypointNodes = [...validVisits];
+      finalDestNode = rawDest;
+    } else if (validVisits.length > 0) {
+      waypointNodes = validVisits.slice(0, validVisits.length - 1);
+      finalDestNode = validVisits[validVisits.length - 1];
     }
 
+    if (!finalDestNode) {
+      return null;
+    }
+
+    // 출발지와 최종 도착지가 100m 이내 동일 좌표면(자택->방문->자택)
+    // TMAP/네이버지도에서 경로 오류를 일으키므로 출발지를 현재 GPS로 자동 전환
+    let startNode = rawOrigin && rawOrigin.lat && rawOrigin.lng ? rawOrigin : null;
+    if (startNode && finalDestNode) {
+      const sameOriginDestDist = getDistanceKm(
+        startNode.lat,
+        startNode.lng,
+        finalDestNode.lat,
+        finalDestNode.lng
+      );
+      if (sameOriginDestDist !== null && sameOriginDestDist < 0.1) {
+        startNode = null;
+      }
+    }
+
+    // 최종 목적지와 50m 이내로 겹치는 마지막 경유지 제거
+    if (waypointNodes.length > 0) {
+      const lastWp = waypointNodes[waypointNodes.length - 1];
+      const distToDest = getDistanceKm(
+        lastWp.lat,
+        lastWp.lng,
+        finalDestNode.lat,
+        finalDestNode.lng
+      );
+      if (distToDest !== null && distToDest < 0.05) {
+        waypointNodes.pop();
+      }
+    }
+
+    // TMAP(최대 5개) / 네이버 지도(최대 5개) 경유지 제한 준수
+    const cappedWaypoints = waypointNodes.slice(0, 5);
     const displaySequence = [
-      ...(startNode ? [startNode] : []),
-      ...waypointNodes,
+      ...(startNode
+        ? [startNode]
+        : [{ id: 'gps-now', name: '현재 GPS 위치 (출발)', lat: 0, lng: 0 }]),
+      ...cappedWaypoints,
       finalDestNode,
     ];
 
-    const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
     let deepLink = '';
-
     if (app === 'tmap') {
-      // TMAP 공식 다중 경유지 규격: rGoName/X/Y(목적지) + rStName/X/Y(출발지) + rV1~rV5Name/X/Y(경유지)
+      // TMAP 공식 다중 경유지 스킴: rGoName/X/Y + rV1~rV5Name/X/Y
       deepLink = `tmap://route?rGoName=${encodeURIComponent(
         finalDestNode.name
-      )}${
-        finalDestNode.lng && finalDestNode.lat
-          ? `&rGoX=${finalDestNode.lng}&rGoY=${finalDestNode.lat}`
-          : ''
-      }`;
+      )}&rGoX=${finalDestNode.lng}&rGoY=${finalDestNode.lat}`;
 
-      if (startNode && startNode.lng && startNode.lat) {
+      if (startNode) {
         deepLink += `&rStName=${encodeURIComponent(startNode.name)}&rStX=${
           startNode.lng
         }&rStY=${startNode.lat}`;
       }
 
-      waypointNodes.slice(0, 5).forEach((wp, idx) => {
-        deepLink += `&rV${idx + 1}Name=${encodeURIComponent(wp.name)}${
-          wp.lng && wp.lat ? `&rV${idx + 1}X=${wp.lng}&rV${idx + 1}Y=${wp.lat}` : ''
-        }`;
+      cappedWaypoints.forEach((wp, idx) => {
+        deepLink += `&rV${idx + 1}Name=${encodeURIComponent(wp.name)}&rV${
+          idx + 1
+        }X=${wp.lng}&rV${idx + 1}Y=${wp.lat}`;
       });
     } else {
-      // 네이버 지도 공식 다중 경유지 규격: slat/slng/sname + v1~v5 + dlat/dlng/dname
-      deepLink = `nmap://route/car?dname=${encodeURIComponent(
-        finalDestNode.name
-      )}${
-        finalDestNode.lng && finalDestNode.lat
-          ? `&dlng=${finalDestNode.lng}&dlat=${finalDestNode.lat}`
-          : ''
-      }`;
+      // 네이버 지도 공식 다중 경유지 스킴: dlat/dlng/dname + v1~v5 + appname
+      const appName = encodeURIComponent(
+        typeof window !== 'undefined' && window.location?.origin
+          ? window.location.origin
+          : 'fieldops.scheduler'
+      );
+      deepLink = `nmap://route/car?dlat=${finalDestNode.lat}&dlng=${
+        finalDestNode.lng
+      }&dname=${encodeURIComponent(finalDestNode.name)}`;
 
-      if (startNode && startNode.lng && startNode.lat) {
+      if (startNode) {
         deepLink += `&slat=${startNode.lat}&slng=${
           startNode.lng
         }&sname=${encodeURIComponent(startNode.name)}`;
       }
 
-      waypointNodes.slice(0, 5).forEach((wp, idx) => {
-        deepLink += `&v${idx + 1}name=${encodeURIComponent(wp.name)}${
-          wp.lng && wp.lat
-            ? `&v${idx + 1}lng=${wp.lng}&v${idx + 1}lat=${wp.lat}`
-            : ''
-        }`;
+      cappedWaypoints.forEach((wp, idx) => {
+        deepLink += `&v${idx + 1}lat=${wp.lat}&v${idx + 1}lng=${
+          wp.lng
+        }&v${idx + 1}name=${encodeURIComponent(wp.name)}`;
       });
 
-      deepLink += `&appname=com.hancomwith.fieldops`;
+      deepLink += `&appname=${appName}`;
     }
 
+    return {
+      appName: app === 'tmap' ? 'TMAP' : '네이버 지도',
+      appKey: app,
+      deepLink,
+      visits: displaySequence,
+      singleStops: [...cappedWaypoints, finalDestNode],
+      webUrl:
+        app === 'naver'
+          ? `https://map.naver.com/p/search/${encodeURIComponent(
+              finalDestNode.name
+            )}`
+          : null,
+    };
+  };
+
+  // 반드시 동기 함수로 유지해야 iOS Safari / 모바일 Chrome에서 사용자 제스처가 유지됨
+  const launchMultiNavi = (app, forcePreviewModal = false) => {
+    const payload = buildNaviPayload(app);
+    if (!payload) {
+      showToast('GPS 좌표가 확인된 방문 일정이 없습니다. 주소를 다시 검색해 주세요.');
+      return;
+    }
+
+    if (forcePreviewModal) {
+      setNaviGuideModal({
+        ...payload,
+        isFallback: false,
+      });
+      return;
+    }
+
+    const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+
     if (isMobile) {
-      window.location.href = deepLink;
+      window.location.href = payload.deepLink;
+
+      setTimeout(() => {
+        if (!document.hidden) {
+          setNaviGuideModal({
+            ...payload,
+            isFallback: true,
+          });
+        }
+      }, 1800);
     } else {
       setNaviGuideModal({
-        appName: app === 'tmap' ? 'TMAP' : '네이버 지도',
-        visits: displaySequence,
-        webUrl:
-          app === 'naver'
-            ? `https://map.naver.com/p/search/${encodeURIComponent(
-                finalDestNode.name
-              )}`
-            : null,
+        ...payload,
+        isFallback: false,
       });
     }
   };
@@ -1857,21 +2392,30 @@ export default function App() {
             </div>
           )}
 
-          {/* 탭 2: 고객 등록 (실시간 검색 + 예상 소요 시간) */}
+          {/* 탭 2: 고객 등록 */}
           {activeTab === 'add' && (
             <div className="space-y-4">
-              <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-sm">
-                <label className="text-xs font-bold text-slate-700 flex items-center gap-1.5 mb-2">
-                  <Search className="w-3.5 h-3.5 text-blue-600" />
-                  <span>고객사 / 건물명 실시간 주소 검색</span>
-                </label>
+              <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-sm space-y-2.5">
+                <div className="flex items-center justify-between gap-2">
+                  <label className="text-xs font-bold text-slate-700 flex items-center gap-1.5">
+                    <Search className="w-3.5 h-3.5 text-blue-600" />
+                    <span>고객사 / 건물명 / 지번 통합 검색</span>
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => openDaumPostcodeModal('client', searchKeyword)}
+                    className="text-[11px] font-bold bg-blue-50 hover:bg-blue-100 text-blue-700 border border-blue-200 px-2.5 py-1 rounded-lg transition-colors"
+                  >
+                    공식 주소록으로 찾기
+                  </button>
+                </div>
                 <form onSubmit={handlePlaceSearch} className="flex gap-2">
                   <input
                     ref={searchInputRef}
                     type="text"
                     value={searchKeyword}
                     onChange={(e) => setSearchKeyword(e.target.value)}
-                    placeholder="예: 롯데월드, 판교역, 한국환경공단"
+                    placeholder="예: 여의도동 27-1, 한국투자증권 본사, 분당 한컴"
                     className="flex-1 px-3.5 py-2.5 bg-white text-slate-900 placeholder:text-slate-400 border border-slate-300 rounded-xl text-sm outline-none focus:border-blue-600"
                   />
                   <button
@@ -1884,7 +2428,7 @@ export default function App() {
                 </form>
 
                 {searchResults.length > 0 && (
-                  <div className="mt-3 border border-slate-200 rounded-xl divide-y divide-slate-100 max-h-52 overflow-y-auto">
+                  <div className="mt-2 border border-slate-200 rounded-xl divide-y divide-slate-100 max-h-56 overflow-y-auto shadow-sm">
                     {searchResults.map((item, idx) => (
                       <button
                         type="button"
@@ -2303,30 +2847,46 @@ export default function App() {
 
                   <div className="space-y-2.5 pt-3 border-t border-slate-100">
                     <div className="bg-slate-50 border border-slate-200/80 rounded-xl p-3 space-y-2">
-                      <label className="flex items-center justify-between cursor-pointer">
-                        <span className="text-xs font-bold text-slate-700">
-                          내비 출발지에 [{startPoint === 'HOME' ? '자택' : '회사'}] 포함
-                        </span>
-                        <input
-                          type="checkbox"
-                          checked={includeOriginInNavi}
-                          onChange={(e) => setIncludeOriginInNavi(e.target.checked)}
-                          className="w-4 h-4 accent-blue-600 rounded"
-                        />
-                      </label>
+                      <div className="flex items-center justify-between gap-2">
+                        <label className="flex items-center gap-2 cursor-pointer">
+                          <input
+                            type="checkbox"
+                            checked={includeOriginInNavi}
+                            onChange={(e) => setIncludeOriginInNavi(e.target.checked)}
+                            className="w-4 h-4 accent-blue-600 rounded"
+                          />
+                          <span className="text-xs font-bold text-slate-700">
+                            내비 출발지에 [{startPoint === 'HOME' ? '자택' : '회사'}] 고정 지정
+                          </span>
+                        </label>
+                        <button
+                          type="button"
+                          onClick={() => launchMultiNavi('tmap', true)}
+                          className="text-[10px] font-bold text-blue-700 bg-blue-50 hover:bg-blue-100 px-2 py-1 rounded-lg border border-blue-200 flex items-center gap-1 shrink-0"
+                        >
+                          <Eye className="w-3 h-3" />
+                          <span>경로 미리보기</span>
+                        </button>
+                      </div>
                       <p className="text-[11px] text-slate-500 leading-relaxed">
-                        전송 경로:{' '}
+                        전송 동선:{' '}
                         <strong className="text-slate-700">
-                          {includeOriginInNavi
+                          {includeOriginInNavi && startPoint !== endPoint
                             ? `${startPoint === 'HOME' ? '자택(출발)' : '회사(출발)'} → `
                             : '현재 GPS 위치 → '}
                           {plannedVisits.map((v) => v.name).join(' → ')} →{' '}
                           {endPoint === 'HOME' ? '자택(도착)' : '회사(복귀)'}
                         </strong>
                       </p>
+                      {includeOriginInNavi && startPoint === endPoint && (
+                        <p className="text-[10px] text-amber-700 font-medium">
+                          ※ 출발지와 복귀지가 동일할 경우 내비 앱 경로 오류 방지를 위해 현재 GPS 위치 출발로 자동 전환됩니다.
+                        </p>
+                      )}
                     </div>
 
                     <button
+                      type="button"
                       onClick={() => launchMultiNavi('tmap')}
                       className="w-full bg-[#00498c] hover:bg-[#003a70] text-white font-bold py-3.5 rounded-xl shadow-md flex items-center justify-center gap-2 text-sm transition-colors"
                     >
@@ -2334,6 +2894,7 @@ export default function App() {
                       <span>TMAP 다중 경유지 한 번에 전송</span>
                     </button>
                     <button
+                      type="button"
                       onClick={() => launchMultiNavi('naver')}
                       className="w-full bg-[#03C75A] hover:bg-[#02b04f] text-white font-bold py-3.5 rounded-xl shadow-md flex items-center justify-center gap-2 text-sm transition-colors"
                     >
@@ -2343,26 +2904,43 @@ export default function App() {
                   </div>
                 </div>
               ) : (
-                <div className="py-16 text-center bg-white rounded-2xl border border-slate-200 p-6 space-y-3">
+                <div className="py-14 text-center bg-white rounded-2xl border border-slate-200 p-6 space-y-3">
                   <Calendar className="w-12 h-12 text-slate-300 mx-auto" />
                   <p className="text-sm font-bold text-slate-600">
                     아직 생성된 일과표가 없습니다.
                   </p>
                   <p className="text-xs text-slate-400">
-                    [고객 관리] 탭에서 오늘 방문할 기준 고객사를 선택해 주세요.
+                    [고객 관리] 탭에서 기준 고객사를 선택하거나 아래 버튼으로 샘플 일과표를 바로 미리보실 수 있습니다.
                   </p>
-                  <button
-                    onClick={() => setActiveTab('list')}
-                    className="bg-blue-600 text-white text-xs font-bold px-4 py-2.5 rounded-xl"
-                  >
-                    고객사 선택하러 가기
-                  </button>
+                  <div className="flex flex-col sm:flex-row gap-2 justify-center pt-1">
+                    {clients.filter((c) => c.status !== 'COMPLETED').length > 0 && (
+                      <button
+                        type="button"
+                        onClick={() =>
+                          generateDailySchedule(
+                            clients.filter((c) => c.status !== 'COMPLETED')[0]
+                          )
+                        }
+                        className="bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold px-4 py-2.5 rounded-xl flex items-center justify-center gap-1.5"
+                      >
+                        <Sparkles className="w-3.5 h-3.5" />
+                        <span>샘플 일과표 바로 미리보기</span>
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => setActiveTab('list')}
+                      className="bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-bold px-4 py-2.5 rounded-xl"
+                    >
+                      고객사 선택하러 가기
+                    </button>
+                  </div>
                 </div>
               )}
             </div>
           )}
 
-          {/* 탭 4: 자택/회사 주소 설정 (실시간 검색 지원) */}
+          {/* 탭 4: 자택/회사 주소 설정 */}
           {activeTab === 'settings' && (
             <div className="space-y-4">
               <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm space-y-3">
@@ -2377,19 +2955,27 @@ export default function App() {
                 </div>
               </div>
 
-              {/* 자택 주소 검색 및 입력 카드 */}
               <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm space-y-3">
-                <label className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
-                  <Home className="w-4 h-4 text-blue-600" />
-                  <span>자택 주소 (직출 / 직퇴 기준)</span>
-                </label>
+                <div className="flex items-center justify-between gap-2">
+                  <label className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
+                    <Home className="w-4 h-4 text-blue-600" />
+                    <span>자택 주소 (직출 / 직퇴 기준)</span>
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => openDaumPostcodeModal('home', homeSearchQuery)}
+                    className="text-[11px] font-bold bg-blue-50 hover:bg-blue-100 text-blue-700 border border-blue-200 px-2.5 py-1 rounded-lg transition-colors"
+                  >
+                    공식 주소록
+                  </button>
+                </div>
 
                 <form onSubmit={handleHomeSearch} className="flex gap-2">
                   <input
                     type="text"
                     value={homeSearchQuery}
                     onChange={(e) => setHomeSearchQuery(e.target.value)}
-                    placeholder="자택 도로명 또는 아파트명 검색"
+                    placeholder="자택 도로명·아파트명 입력 (자동완성)"
                     className="flex-1 px-3 py-2 bg-white text-slate-900 placeholder:text-slate-400 border border-slate-300 rounded-xl text-xs outline-none focus:border-blue-600"
                   />
                   <button
@@ -2437,19 +3023,27 @@ export default function App() {
                 </div>
               </div>
 
-              {/* 회사 주소 검색 및 입력 카드 */}
               <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm space-y-3">
-                <label className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
-                  <Building className="w-4 h-4 text-indigo-600" />
-                  <span>회사 주소 (출근 / 복귀 기준)</span>
-                </label>
+                <div className="flex items-center justify-between gap-2">
+                  <label className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
+                    <Building className="w-4 h-4 text-indigo-600" />
+                    <span>회사 주소 (출근 / 복귀 기준)</span>
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() => openDaumPostcodeModal('office', officeSearchQuery)}
+                    className="text-[11px] font-bold bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border border-indigo-200 px-2.5 py-1 rounded-lg transition-colors"
+                  >
+                    공식 주소록
+                  </button>
+                </div>
 
                 <form onSubmit={handleOfficeSearch} className="flex gap-2">
                   <input
                     type="text"
                     value={officeSearchQuery}
                     onChange={(e) => setOfficeSearchQuery(e.target.value)}
-                    placeholder="회사 건물명 또는 도로명 검색"
+                    placeholder="회사 건물명·도로명 입력 (자동완성)"
                     className="flex-1 px-3 py-2 bg-white text-slate-900 placeholder:text-slate-400 border border-slate-300 rounded-xl text-xs outline-none focus:border-blue-600"
                   />
                   <button
@@ -2510,44 +3104,82 @@ export default function App() {
         {/* 하단 네비게이션 */}
         <nav className="fixed bottom-0 w-full max-w-md bg-white border-t border-slate-200 flex justify-around py-2.5 z-20">
           <button
+            type="button"
             onClick={() => setActiveTab('list')}
-            className={`flex flex-col items-center gap-1 text-xs font-bold ${
+            className={`flex flex-col items-center gap-1 text-xs font-bold transition-colors ${
               activeTab === 'list' ? 'text-blue-700' : 'text-slate-400'
             }`}
           >
             <List className="w-5 h-5" />
             <span>고객 관리</span>
           </button>
+
           <button
+            type="button"
             onClick={() => setActiveTab('add')}
-            className={`flex flex-col items-center gap-1 text-xs font-bold ${
+            className={`flex flex-col items-center gap-1 text-xs font-bold transition-colors ${
               activeTab === 'add' ? 'text-blue-700' : 'text-slate-400'
             }`}
           >
             <Plus className="w-5 h-5" />
             <span>고객 등록</span>
           </button>
+
           <button
+            type="button"
             onClick={() => setActiveTab('route')}
-            className={`flex flex-col items-center gap-1 text-xs font-bold ${
+            className={`flex flex-col items-center gap-1 text-xs font-bold transition-colors ${
               activeTab === 'route' ? 'text-blue-700' : 'text-slate-400'
             }`}
           >
             <Calendar className="w-5 h-5" />
-            <span>스케줄러</span>
+            <span>일과표/동선</span>
           </button>
+
           <button
+            type="button"
             onClick={() => setActiveTab('settings')}
-            className={`flex flex-col items-center gap-1 text-xs font-bold ${
+            className={`flex flex-col items-center gap-1 text-xs font-bold transition-colors ${
               activeTab === 'settings' ? 'text-blue-700' : 'text-slate-400'
             }`}
           >
             <Settings className="w-5 h-5" />
-            <span>설정</span>
+            <span>기준지 설정</span>
           </button>
         </nav>
 
-        {/* PC 내비게이션 안내 모달 */}
+        {/* 카카오/다음 공식 주소·건물명 검색 내장 모달 */}
+        {postcodeModalTarget && (
+          <div className="fixed inset-0 bg-black/60 flex items-center justify-center p-4 z-50">
+            <div className="bg-white rounded-3xl w-full max-w-md overflow-hidden shadow-2xl flex flex-col">
+              <div className="bg-slate-900 text-white px-4 py-3.5 flex items-center justify-between">
+                <span className="font-bold text-sm flex items-center gap-1.5">
+                  <Search className="w-4 h-4 text-blue-400" />
+                  <span>
+                    {postcodeModalTarget === 'client'
+                      ? '고객사 공식 건물명·도로명 검색'
+                      : postcodeModalTarget === 'home'
+                      ? '자택 공식 주소 검색'
+                      : '회사 공식 주소 검색'}
+                  </span>
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setPostcodeModalTarget(null)}
+                  className="text-xs font-bold bg-slate-700 hover:bg-slate-600 px-3 py-1.5 rounded-lg"
+                >
+                  닫기
+                </button>
+              </div>
+              <div
+                ref={postcodeContainerRef}
+                className="w-full h-[430px] bg-white"
+              />
+            </div>
+          </div>
+        )}
+
+        {/* 내비게이션 안내 및 인앱 브라우저 대체 실행 모달 */}
         {naviGuideModal && (
           <div className="fixed inset-0 bg-black/60 flex items-center justify-center p-5 z-50">
             <div className="bg-white rounded-3xl p-6 w-full max-w-sm shadow-2xl space-y-4">
@@ -2555,34 +3187,86 @@ export default function App() {
                 <Navigation className="w-5 h-5" />
                 <span>{naviGuideModal.appName} 다중 경유지 전송</span>
               </div>
-              <div className="bg-slate-50 rounded-2xl p-3.5 space-y-1.5 text-xs text-slate-700">
+
+              <div className="bg-slate-50 rounded-2xl p-3.5 space-y-2 text-xs text-slate-700 max-h-56 overflow-y-auto">
                 {naviGuideModal.visits.map((v, i) => (
-                  <div key={v.id} className="font-bold">
-                    {i + 1}. {v.name}
+                  <div
+                    key={v.id}
+                    className="flex items-center justify-between gap-2 font-bold"
+                  >
+                    <span className="truncate">
+                      {i === 0
+                        ? `출발: ${v.name}`
+                        : i === naviGuideModal.visits.length - 1
+                        ? `도착: ${v.name}`
+                        : `경유 ${i}: ${v.name}`}
+                    </span>
+                    {v.lat && v.lng ? (
+                      <a
+                        href={
+                          naviGuideModal.appKey === 'tmap'
+                            ? `tmap://route?rGoName=${encodeURIComponent(
+                                v.name
+                              )}&rGoX=${v.lng}&rGoY=${v.lat}`
+                            : `nmap://route/car?dlat=${v.lat}&dlng=${
+                                v.lng
+                              }&dname=${encodeURIComponent(
+                                v.name
+                              )}&appname=${encodeURIComponent(
+                                window.location?.origin || 'fieldops.scheduler'
+                              )}`
+                        }
+                        className="shrink-0 text-[10px] bg-white border border-slate-300 px-2 py-1 rounded-lg text-blue-700 flex items-center gap-0.5"
+                      >
+                        <span>단독안내</span>
+                        <ExternalLink className="w-2.5 h-2.5" />
+                      </a>
+                    ) : null}
                   </div>
                 ))}
               </div>
-              <p className="text-xs text-slate-500 leading-relaxed">
-                스마트폰에서 실행 시 <strong>{naviGuideModal.appName}</strong>{' '}
-                앱이 즉시 열리며 위 경유지 전체가 자동 입력됩니다.
-              </p>
-              <div className="flex gap-2">
-                {naviGuideModal.webUrl && (
-                  <a
-                    href={naviGuideModal.webUrl}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="flex-1 bg-[#03C75A] text-white font-bold py-3 rounded-xl text-xs text-center"
-                  >
-                    PC 웹 지도로 보기
-                  </a>
-                )}
-                <button
-                  onClick={() => setNaviGuideModal(null)}
-                  className="flex-1 bg-blue-600 text-white font-bold py-3 rounded-xl text-xs"
+
+              {naviGuideModal.isFallback ? (
+                <p className="text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded-xl p-3 leading-relaxed">
+                  카카오톡 등 인앱 브라우저에서는 앱 자동 전환이 제한될 수 있습니다. 아래 <strong>직접 앱 열기</strong> 버튼을 누르거나 Safari/Chrome 브라우저에서 열어주세요.
+                </p>
+              ) : (
+                <p className="text-xs text-slate-500 leading-relaxed">
+                  스마트폰에서 실행 시 <strong>{naviGuideModal.appName}</strong>{' '}
+                  앱이 열리며 위 경유지 전체가 순서대로 입력됩니다.
+                </p>
+              )}
+
+              <div className="flex flex-col gap-2">
+                <a
+                  href={naviGuideModal.deepLink}
+                  className={`w-full text-white font-bold py-3 rounded-xl text-xs text-center ${
+                    naviGuideModal.appKey === 'tmap'
+                      ? 'bg-[#00498c]'
+                      : 'bg-[#03C75A]'
+                  }`}
                 >
-                  확인
-                </button>
+                  {naviGuideModal.appName} 앱 직접 열기
+                </a>
+                <div className="flex gap-2">
+                  {naviGuideModal.webUrl && (
+                    <a
+                      href={naviGuideModal.webUrl}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="flex-1 bg-slate-100 text-slate-700 font-bold py-3 rounded-xl text-xs text-center"
+                    >
+                      웹 지도로 보기
+                    </a>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => setNaviGuideModal(null)}
+                    className="flex-1 bg-slate-800 text-white font-bold py-3 rounded-xl text-xs"
+                  >
+                    닫기
+                  </button>
+                </div>
               </div>
             </div>
           </div>
@@ -2638,7 +3322,7 @@ function SwipeableClientCard({
   const [isDragging, setIsDragging] = useState(false);
   const startXRef = useRef(0);
   const startYRef = useRef(0);
-  const swipeAxisRef = useRef(null); // 'horizontal' | 'vertical' | null
+  const swipeAxisRef = useRef(null);
 
   const handleStart = (clientX, clientY = 0) => {
     startXRef.current = clientX;
