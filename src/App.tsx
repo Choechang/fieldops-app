@@ -207,9 +207,9 @@ function buildKnowHowWithMeta(cleanKnowHow, metaObj) {
     lat: Number(metaObj.lat) || 0,
     lng: Number(metaObj.lng) || 0,
     time: Number(metaObj.estimated_time) || 60,
-    status: metaObj.status || 'PENDING',
+    status: metaObj.status === 'COMPLETED' ? 'COMPLETED' : 'PENDING',
   });
-  return base ? `${base}\n[META:${payload}]` : `[META:${payload}]`;
+  return base ? `${base} [META:${payload}]` : `[META:${payload}]`;
 }
 
 // --- [OSRM 실제 도로 경로 + 수도권 교통량 보정 이동시간 계산] ---
@@ -255,8 +255,7 @@ async function calculateRealTravelInfo(fromPoint, toPoint, departMinutes, routeC
   } else {
     try {
       const controller = new AbortController();
-      // 모바일 통신망 지연을 고려해 타임아웃을 4.5초로 확보
-      const timeoutId = setTimeout(() => controller.abort(), 4500);
+      const timeoutId = setTimeout(() => controller.abort(), 3500);
       const url = `https://router.project-osrm.org/route/v1/driving/${fromPoint.lng},${fromPoint.lat};${toPoint.lng},${toPoint.lat}?overview=false`;
       const res = await fetch(url, { signal: controller.signal });
       clearTimeout(timeoutId);
@@ -283,11 +282,9 @@ async function calculateRealTravelInfo(fromPoint, toPoint, departMinutes, routeC
     const parkingBuffer = roadDistanceKm < 2 ? 3 : 5;
     totalMins = baseDriveMins * traffic.multiplier + parkingBuffer;
   } else if (straightKm !== null) {
-    finalKm = straightKm * 1.32;
+    finalKm = straightKm * 1.35;
     const parkingBuffer = finalKm < 2 ? 3 : 5;
-    // 10km 이상 구 간 이동 시 도시고속도로 평균 속도(44km/h) 반영해 과다 산출 방지
-    const effectiveSpeed = finalKm > 10 ? 44 : traffic.avgSpeedKmh;
-    totalMins = (finalKm / effectiveSpeed) * 60 + parkingBuffer;
+    totalMins = (finalKm / traffic.avgSpeedKmh) * 60 + parkingBuffer;
   }
 
   const roundedMins = Math.max(5, Math.round(totalMins / 5) * 5);
@@ -314,9 +311,8 @@ export default function App() {
   const [plannedVisits, setPlannedVisits] = useState([]);
   const [optimizationNote, setOptimizationNote] = useState('');
   const [autoFillMorningGap, setAutoFillMorningGap] = useState(true);
-  // 스마트폰 실주행 시 출발지(현위치)와 최종 도착지(자택)가 겹쳐 경유지가 무시되는 현상을 막기 위해
-  // 기본값은 마지막 방문 고객사를 최종 목적지로 설정 (필요 시 복귀지 포함 체크 가능)
   const [includeReturnInNavi, setIncludeReturnInNavi] = useState(false);
+  const [tmapStepIndex, setTmapStepIndex] = useState(0);
 
   // 자택 / 회사 환경설정 (주소 + 좌표)
   const [homeAddress, setHomeAddress] = useState(
@@ -367,7 +363,6 @@ export default function App() {
   const [toastMessage, setToastMessage] = useState('');
   const [confirmDialog, setConfirmDialog] = useState(null);
   const [naviGuideModal, setNaviGuideModal] = useState(null);
-  const [tmapStepIndex, setTmapStepIndex] = useState(0);
 
   // 고객 등록 폼 상태
   const [newName, setNewName] = useState('');
@@ -1996,40 +1991,115 @@ export default function App() {
         }
       }
 
-      // [단계 2: 점심시간(11:30~13:00) 삽입 및 오후 추가 고객사 배정]
-      const remainingAfternoonPool = sameZoneCandidates.filter(
-        (c) => !usedIds.has(c.id)
-      );
-      // 직퇴 시에는 회사 복귀 이동이 없으므로 17:30까지 오후 고객사 추가 배정 허용
+      // [단계 2: 점심시간(11:30~13:00) 삽입 및 17시까지 최대한 추가 고객사 배정]
+      const latestAllowedArrival =
+        overrideEnd === 'HOME' ? 17 * 60 + 10 : DAY_END - 30;
       const afternoonVisitCutoff =
-        overrideEnd === 'HOME' ? 17 * 60 + 30 : DAY_END;
-      const maxDailyVisits = overrideEnd === 'HOME' ? 4 : 3;
+        overrideEnd === 'HOME' ? 18 * 60 + 30 : DAY_END;
+      const maxDailyVisits = overrideEnd === 'HOME' ? 12 : 5;
 
-      for (let i = 0; i < remainingAfternoonPool.length; i++) {
-        if (finalVisitList.length >= maxDailyVisits) break;
+      while (finalVisitList.length < maxDailyVisits) {
         const prevClient = finalVisitList[finalVisitList.length - 1];
-        const nextClient = remainingAfternoonPool[i];
-        const nextWork = Number(nextClient.estimated_time) || 60;
 
-        const interTravelInfo = await calculateRealTravelInfo(
-          prevClient,
-          nextClient,
-          currentTime,
-          routeCacheRef.current
+        // 직전 방문 고객사 기준으로 가장 가까운 미방문 고객사 순으로 동적 정렬
+        const sortByNearestFromPrev = (list) =>
+          [...list].sort((a, b) => {
+            const dA = getDistanceKm(
+              prevClient.lat,
+              prevClient.lng,
+              a.lat,
+              a.lng
+            );
+            const dB = getDistanceKm(
+              prevClient.lat,
+              prevClient.lng,
+              b.lat,
+              b.lng
+            );
+            if (dA !== null && dB !== null) return dA - dB;
+            if (dA !== null) return -1;
+            if (dB !== null) return 1;
+            return (b.simScore || 0) - (a.simScore || 0);
+          });
+
+        const primaryUnvisited = sortByNearestFromPrev(
+          sameZoneCandidates.filter((c) => !usedIds.has(c.id))
         );
-        const interTravel = interTravelInfo.minutes;
 
-        let departForNext = currentTime;
-        let nextStart = currentTime + interTravel;
+        // 직퇴 시 17시 전까지 시간이 남았는데 38km 권역 후보가 소진된 경우, 인접 광역(65km 이내)까지 확장 탐색
+        const extendedUnvisited =
+          overrideEnd === 'HOME' &&
+          currentTime < DIRECT_LEAVE_MIN &&
+          primaryUnvisited.length === 0
+            ? sortByNearestFromPrev(
+                enrichedCandidates.filter((c) => {
+                  if (usedIds.has(c.id)) return false;
+                  const distFromPrev = getDistanceKm(
+                    prevClient.lat,
+                    prevClient.lng,
+                    c.lat,
+                    c.lng
+                  );
+                  return distFromPrev !== null && distFromPrev <= 65;
+                })
+              )
+            : [];
 
-        if (!lunchInserted) {
-          const morningAvail = LUNCH_START - nextStart;
-          const canSplitAcrossLunch =
-            nextStart < LUNCH_START &&
-            morningAvail >= 30 &&
-            nextWork - morningAvail >= 15;
+        const candidateQueue =
+          primaryUnvisited.length > 0 ? primaryUnvisited : extendedUnvisited;
 
-          if (!canSplitAcrossLunch && nextStart + nextWork > LUNCH_START) {
+        if (candidateQueue.length === 0) break;
+
+        let scheduledOne = false;
+
+        for (let i = 0; i < candidateQueue.length; i++) {
+          const nextClient = candidateQueue[i];
+          const nextWork = Number(nextClient.estimated_time) || 60;
+
+          const interTravelInfo = await calculateRealTravelInfo(
+            prevClient,
+            nextClient,
+            currentTime,
+            routeCacheRef.current
+          );
+          const interTravel = interTravelInfo.minutes;
+
+          let departForNext = currentTime;
+          let nextStart = currentTime + interTravel;
+          let willInsertLunchBefore = false;
+
+          if (!lunchInserted) {
+            const morningAvail = LUNCH_START - nextStart;
+            const canSplitAcrossLunch =
+              nextStart < LUNCH_START &&
+              morningAvail >= 30 &&
+              nextWork - morningAvail >= 15;
+
+            if (!canSplitAcrossLunch && nextStart + nextWork > LUNCH_START) {
+              willInsertLunchBefore = true;
+              departForNext = LUNCH_END;
+              nextStart = LUNCH_END + interTravel;
+            }
+          }
+
+          let projectedFinish = nextStart + nextWork;
+          if (
+            !lunchInserted &&
+            !willInsertLunchBefore &&
+            nextStart + nextWork > LUNCH_START
+          ) {
+            const morningAvail = LUNCH_START - nextStart;
+            projectedFinish = LUNCH_END + (nextWork - morningAvail);
+          }
+
+          if (
+            nextStart > latestAllowedArrival ||
+            projectedFinish > afternoonVisitCutoff
+          ) {
+            continue;
+          }
+
+          if (willInsertLunchBefore) {
             schedule.push({
               type: 'LUNCH',
               time: '11:30 ~ 13:00',
@@ -2037,50 +2107,45 @@ export default function App() {
               address: '점심시간 제외 자동 스케줄링',
             });
             lunchInserted = true;
-            departForNext = LUNCH_END;
-            nextStart = LUNCH_END + interTravel;
           }
-        }
 
-        let projectedFinish = nextStart + nextWork;
-        if (!lunchInserted && nextStart + nextWork > LUNCH_START) {
-          const morningAvail = LUNCH_START - nextStart;
-          projectedFinish = LUNCH_END + (nextWork - morningAvail);
-        }
+          finalVisitList.push(nextClient);
+          usedIds.add(nextClient.id);
 
-        if (projectedFinish > afternoonVisitCutoff) {
+          schedule.push({
+            type: 'TRAVEL',
+            time: `${formatTime(departForNext)} ~ ${formatTime(nextStart)}`,
+            duration: interTravel,
+            distanceKm: interTravelInfo.distanceKm,
+            label: interTravelInfo.label,
+          });
+
+          const splitRes = pushVisitWithLunchSplit({
+            schedule,
+            client: nextClient,
+            order: finalVisitList.length,
+            arrivalTime: nextStart,
+            workDuration: nextWork,
+            lunchInserted,
+            lunchStart: LUNCH_START,
+            lunchEnd: LUNCH_END,
+          });
+
+          currentTime = splitRes.finishTime;
+          lunchInserted = splitRes.lunchInserted;
+
+          if (splitRes.wasSplit) {
+            splitSummaryNotes.push(
+              `[${nextClient.name}] 오전(${splitRes.morningChunk}분) + 오후(${splitRes.afternoonChunk}분) 분할 진행`
+            );
+          }
+
+          scheduledOne = true;
           break;
         }
 
-        finalVisitList.push(nextClient);
-        usedIds.add(nextClient.id);
-
-        schedule.push({
-          type: 'TRAVEL',
-          time: `${formatTime(departForNext)} ~ ${formatTime(nextStart)}`,
-          duration: interTravel,
-          distanceKm: interTravelInfo.distanceKm,
-          label: interTravelInfo.label,
-        });
-
-        const splitRes = pushVisitWithLunchSplit({
-          schedule,
-          client: nextClient,
-          order: finalVisitList.length,
-          arrivalTime: nextStart,
-          workDuration: nextWork,
-          lunchInserted,
-          lunchStart: LUNCH_START,
-          lunchEnd: LUNCH_END,
-        });
-
-        currentTime = splitRes.finishTime;
-        lunchInserted = splitRes.lunchInserted;
-
-        if (splitRes.wasSplit) {
-          splitSummaryNotes.push(
-            `[${nextClient.name}] 오전(${splitRes.morningChunk}분) + 오후(${splitRes.afternoonChunk}분) 분할 진행`
-          );
+        if (!scheduledOne) {
+          break;
         }
       }
 
@@ -2107,22 +2172,22 @@ export default function App() {
         currentTime = LUNCH_END;
       }
 
-      // 직퇴 선택 시 최소 17:00까지는 마지막 고객사에 상주한 뒤 출발하도록 보정
-      if (overrideEnd === 'HOME' && currentTime < DIRECT_LEAVE_MIN) {
-        const stayMins = DIRECT_LEAVE_MIN - currentTime;
-        schedule.push({
-          type: 'CLIENT_STAY',
-          time: `${formatTime(currentTime)} ~ ${formatTime(DIRECT_LEAVE_MIN)}`,
-          title: `${lastClient.name} 현장 상주 및 점검 리포트 정리`,
-          detail: `직퇴 기준(17:00 이후 출발) · ${stayMins}분`,
-          address: lastClient.address,
-        });
-        currentTime = DIRECT_LEAVE_MIN;
-        note = `${
-          note ? note + ' ' : ''
-        }직퇴 규정에 따라 17:00까지 [${
-          lastClient.name
-        }] 현장에 상주하며 점검 결과 정리 후 자택으로 출발합니다.`;
+      if (overrideEnd === 'HOME') {
+        if (currentTime >= DIRECT_LEAVE_MIN) {
+          note = `${
+            note ? note + ' ' : ''
+          }17:00 이후까지 방문 가능한 고객사를 최대한 배정하여 총 ${
+            finalVisitList.length
+          }곳 점검(${formatTime(currentTime)} 종료) 후 자택으로 직퇴합니다.`;
+        } else {
+          note = `${
+            note ? note + ' ' : ''
+          }배정 가능한 대기 고객사(${
+            finalVisitList.length
+          }곳)를 모두 방문 완료하여 ${formatTime(
+            currentTime
+          )}에 현장 일정을 마치고 자택으로 출발합니다.`;
+        }
       }
 
       const departFromLast = currentTime;
@@ -2150,7 +2215,7 @@ export default function App() {
           overrideEnd === 'HOME' ? '자택 도착 (직퇴)' : '회사 복귀 (퇴근)',
         detail:
           overrideEnd === 'HOME'
-            ? `${formatTime(departFromLast)} 현장 출발 기준`
+            ? `${formatTime(departFromLast)} 마지막 현장 출발`
             : '회사 복귀 완료',
         naviName:
           overrideEnd === 'HOME' ? '자택 (도착)' : '회사 (복귀)',
@@ -2160,7 +2225,7 @@ export default function App() {
         isOvertime:
           overrideEnd === 'OFFICE'
             ? arrivalEnd > DAY_END
-            : departFromLast > 18 * 60,
+            : departFromLast > 18 * 60 + 30,
       });
 
       setPlannedVisits(finalVisitList);
@@ -2904,7 +2969,7 @@ export default function App() {
                     }`}
                   >
                     {endPoint === 'HOME'
-                      ? '직퇴 기준: 17:00까지 고객사 상주 후 출발'
+                      ? '직퇴 기준: 17:00까지 추가 고객사 최대 배정'
                       : '복귀 기준: 점검 종료 즉시 회사 복귀'}
                   </span>
                 </div>
@@ -3003,8 +3068,6 @@ export default function App() {
                                 ? 'bg-slate-800'
                                 : ev.type === 'OFFICE_WORK'
                                 ? 'bg-indigo-600'
-                                : ev.type === 'CLIENT_STAY'
-                                ? 'bg-teal-600'
                                 : ev.type === 'LUNCH'
                                 ? 'bg-amber-500'
                                 : 'bg-blue-600'
@@ -3014,8 +3077,6 @@ export default function App() {
                               <Home className="w-3 h-3" />
                             ) : ev.type === 'OFFICE_WORK' ? (
                               <Briefcase className="w-3 h-3" />
-                            ) : ev.type === 'CLIENT_STAY' ? (
-                              <Clock className="w-3 h-3" />
                             ) : ev.type === 'LUNCH' ? (
                               <Coffee className="w-3 h-3" />
                             ) : (
@@ -3031,8 +3092,6 @@ export default function App() {
                                 ? 'bg-amber-50 border border-amber-200/80'
                                 : ev.type === 'OFFICE_WORK'
                                 ? 'bg-indigo-50/60 border border-indigo-200/80'
-                                : ev.type === 'CLIENT_STAY'
-                                ? 'bg-teal-50/70 border border-teal-200/80'
                                 : ev.type === 'VISIT'
                                 ? 'bg-blue-50/40 border border-blue-100'
                                 : 'bg-slate-50 border border-slate-100'
@@ -3045,8 +3104,6 @@ export default function App() {
                                     ? 'bg-amber-200/70 text-amber-900'
                                     : ev.type === 'OFFICE_WORK'
                                     ? 'bg-indigo-100 text-indigo-800'
-                                    : ev.type === 'CLIENT_STAY'
-                                    ? 'bg-teal-100 text-teal-800'
                                     : ev.type === 'VISIT'
                                     ? 'bg-blue-100 text-blue-800'
                                     : 'bg-slate-200 text-slate-700'
@@ -3059,8 +3116,6 @@ export default function App() {
                                   className={`text-[11px] font-bold ${
                                     ev.type === 'OFFICE_WORK'
                                       ? 'text-indigo-600'
-                                      : ev.type === 'CLIENT_STAY'
-                                      ? 'text-teal-700'
                                       : 'text-blue-600'
                                   }`}
                                 >
