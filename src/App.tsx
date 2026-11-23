@@ -239,6 +239,7 @@ export default function App() {
   const [plannedVisits, setPlannedVisits] = useState([]);
   const [optimizationNote, setOptimizationNote] = useState('');
   const [autoFillMorningGap, setAutoFillMorningGap] = useState(true);
+  const [includeOriginInNavi, setIncludeOriginInNavi] = useState(true);
 
   // 자택 / 회사 환경설정 (주소 + 좌표)
   const [homeAddress, setHomeAddress] = useState(
@@ -1015,8 +1016,11 @@ export default function App() {
             type: 'START',
             time: formatTime(homeDepartTime),
             title: '자택 출발 (직출)',
+            naviName: '자택 (출발)',
             detail: `${formatTime(targetArrival)} 현장 도착 기준`,
             address: homeAddress,
+            lat: activeHomeCoords.lat,
+            lng: activeHomeCoords.lng,
           });
 
           schedule.push({
@@ -1092,8 +1096,11 @@ export default function App() {
             type: 'START',
             time: formatTime(homeDepartTime),
             title: '자택 출발 (직출)',
+            naviName: '자택 (출발)',
             detail: `${formatTime(targetArrival)} 현장 도착 기준`,
             address: homeAddress,
+            lat: activeHomeCoords.lat,
+            lng: activeHomeCoords.lng,
           });
 
           schedule.push({
@@ -1173,8 +1180,11 @@ export default function App() {
               type: 'START',
               time: formatTime(OFFICE_EARLIEST_DEPART),
               title: '회사 출발 (출근)',
+              naviName: '회사 (출발)',
               detail: '09:00 첫 출발 기준',
               address: officeAddress,
+              lat: activeOfficeCoords.lat,
+              lng: activeOfficeCoords.lng,
             });
 
             schedule.push({
@@ -1257,7 +1267,10 @@ export default function App() {
               type: 'START',
               time: formatTime(idealDepart),
               title: '회사 출발 → 현장 이동',
+              naviName: '회사 (출발)',
               address: officeAddress,
+              lat: activeOfficeCoords.lat,
+              lng: activeOfficeCoords.lng,
             });
 
             schedule.push({
@@ -1289,8 +1302,11 @@ export default function App() {
               type: 'START',
               time: formatTime(OFFICE_EARLIEST_DEPART),
               title: '회사 출발 (출근)',
+              naviName: '회사 (출발)',
               detail: '09:00 출발 기준',
               address: officeAddress,
+              lat: activeOfficeCoords.lat,
+              lng: activeOfficeCoords.lng,
             });
             schedule.push({
               type: 'TRAVEL',
@@ -1321,8 +1337,11 @@ export default function App() {
             type: 'START',
             time: formatTime(OFFICE_EARLIEST_DEPART),
             title: '회사 출발 (출근)',
+            naviName: '회사 (출발)',
             detail: '09:00 출발 기준',
             address: officeAddress,
+            lat: activeOfficeCoords.lat,
+            lng: activeOfficeCoords.lng,
           });
           schedule.push({
             type: 'TRAVEL',
@@ -1483,57 +1502,172 @@ export default function App() {
         time: formatTime(arrivalEnd),
         title:
           overrideEnd === 'HOME' ? '자택 도착 (직퇴)' : '회사 복귀 (퇴근)',
+        naviName:
+          overrideEnd === 'HOME' ? '자택 (도착)' : '회사 (복귀)',
         address: overrideEnd === 'HOME' ? homeAddress : officeAddress,
+        lat: returnPoint.lat,
+        lng: returnPoint.lng,
         isOvertime: arrivalEnd > DAY_END,
       });
 
       setPlannedVisits(finalVisitList);
       setDailySchedule(schedule);
       setOptimizationNote(note);
+    } catch (error) {
+      showToast('일과표 생성 중 오류가 발생했습니다.');
     } finally {
       setIsOptimizing(false);
     }
   };
 
-  // --- [7. TMAP / 네이버 지도 다중 경유지 길안내 실행] ---
-  const launchMultiNavi = (app) => {
-    const visits = [];
+  // --- [7. TMAP / 네이버 지도 다중 경유지 길안내 실행 (출발지·경유지·복귀지 전체 반영)] ---
+  const buildFullNaviStops = () => {
+    const startItem = dailySchedule.find((item) => item.type === 'START');
+    const endItem = dailySchedule.find((item) => item.type === 'END');
+
+    const visitStops = [];
     const seenIds = new Set();
     dailySchedule.forEach((item) => {
       if (item.type === 'VISIT' && item.client && !seenIds.has(item.client.id)) {
         seenIds.add(item.client.id);
-        visits.push(item.client);
+        visitStops.push({
+          id: `visit-${item.client.id}`,
+          name: item.client.name,
+          address: item.client.address,
+          lat: Number(item.client.lat) || 0,
+          lng: Number(item.client.lng) || 0,
+        });
       }
     });
 
-    if (visits.length === 0) {
+    const originStop =
+      includeOriginInNavi && startItem
+        ? {
+            id: 'origin-start',
+            name: startItem.naviName || startItem.title,
+            address: startItem.address,
+            lat:
+              Number(startItem.lat) ||
+              (startPoint === 'HOME' ? homeCoords.lat : officeCoords.lat) ||
+              0,
+            lng:
+              Number(startItem.lng) ||
+              (startPoint === 'HOME' ? homeCoords.lng : officeCoords.lng) ||
+              0,
+          }
+        : null;
+
+    const destStop = endItem
+      ? {
+          id: 'dest-end',
+          name: endItem.naviName || endItem.title,
+          address: endItem.address,
+          lat:
+            Number(endItem.lat) ||
+            (endPoint === 'HOME' ? homeCoords.lat : officeCoords.lat) ||
+            0,
+          lng:
+            Number(endItem.lng) ||
+            (endPoint === 'HOME' ? homeCoords.lng : officeCoords.lng) ||
+            0,
+        }
+      : null;
+
+    return { originStop, visitStops, destStop };
+  };
+
+  const launchMultiNavi = async (app) => {
+    const { originStop, visitStops, destStop } = buildFullNaviStops();
+
+    if (visitStops.length === 0) {
       showToast('안내할 방문 일정이 없습니다.');
       return;
     }
 
-    const dest = visits[visits.length - 1];
-    const waypoints = visits.slice(0, visits.length - 1);
-    const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+    // 좌표가 비어있는 지점이 있다면 전송 직전 자동 보정
+    const ensureCoords = async (stop) => {
+      if (!stop) return null;
+      if (stop.lat && stop.lng) return stop;
+      const resolved = await resolveCoordinates(stop.address, stop.name);
+      return {
+        ...stop,
+        lat: resolved.lat || 0,
+        lng: resolved.lng || 0,
+      };
+    };
 
+    const resolvedOrigin = await ensureCoords(originStop);
+    const resolvedVisits = await Promise.all(visitStops.map(ensureCoords));
+    const resolvedDest = await ensureCoords(destStop);
+
+    // 출발지 / 경유지 / 최종 도착지 구조화
+    let startNode = resolvedOrigin;
+    let waypointNodes = [];
+    let finalDestNode = resolvedDest;
+
+    if (resolvedDest) {
+      waypointNodes = [...resolvedVisits];
+      finalDestNode = resolvedDest;
+    } else {
+      waypointNodes = resolvedVisits.slice(0, resolvedVisits.length - 1);
+      finalDestNode = resolvedVisits[resolvedVisits.length - 1];
+    }
+
+    const displaySequence = [
+      ...(startNode ? [startNode] : []),
+      ...waypointNodes,
+      finalDestNode,
+    ];
+
+    const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
     let deepLink = '';
+
     if (app === 'tmap') {
-      deepLink = `tmap://route?goalname=${encodeURIComponent(dest.name)}${
-        dest.lng ? `&goalx=${dest.lng}&goaly=${dest.lat}` : ''
+      // TMAP 공식 다중 경유지 규격: rGoName/X/Y(목적지) + rStName/X/Y(출발지) + rV1~rV5Name/X/Y(경유지)
+      deepLink = `tmap://route?rGoName=${encodeURIComponent(
+        finalDestNode.name
+      )}${
+        finalDestNode.lng && finalDestNode.lat
+          ? `&rGoX=${finalDestNode.lng}&rGoY=${finalDestNode.lat}`
+          : ''
       }`;
-      waypoints.forEach((wp, idx) => {
-        deepLink += `&pass${idx + 1}name=${encodeURIComponent(wp.name)}${
-          wp.lng ? `&pass${idx + 1}x=${wp.lng}&pass${idx + 1}y=${wp.lat}` : ''
+
+      if (startNode && startNode.lng && startNode.lat) {
+        deepLink += `&rStName=${encodeURIComponent(startNode.name)}&rStX=${
+          startNode.lng
+        }&rStY=${startNode.lat}`;
+      }
+
+      waypointNodes.slice(0, 5).forEach((wp, idx) => {
+        deepLink += `&rV${idx + 1}Name=${encodeURIComponent(wp.name)}${
+          wp.lng && wp.lat ? `&rV${idx + 1}X=${wp.lng}&rV${idx + 1}Y=${wp.lat}` : ''
         }`;
       });
     } else {
-      deepLink = `nmap://route/car?dname=${encodeURIComponent(dest.name)}${
-        dest.lng ? `&dlng=${dest.lng}&dlat=${dest.lat}` : ''
-      }&appname=com.hancomwith.fieldops`;
-      waypoints.forEach((wp, idx) => {
+      // 네이버 지도 공식 다중 경유지 규격: slat/slng/sname + v1~v5 + dlat/dlng/dname
+      deepLink = `nmap://route/car?dname=${encodeURIComponent(
+        finalDestNode.name
+      )}${
+        finalDestNode.lng && finalDestNode.lat
+          ? `&dlng=${finalDestNode.lng}&dlat=${finalDestNode.lat}`
+          : ''
+      }`;
+
+      if (startNode && startNode.lng && startNode.lat) {
+        deepLink += `&slat=${startNode.lat}&slng=${
+          startNode.lng
+        }&sname=${encodeURIComponent(startNode.name)}`;
+      }
+
+      waypointNodes.slice(0, 5).forEach((wp, idx) => {
         deepLink += `&v${idx + 1}name=${encodeURIComponent(wp.name)}${
-          wp.lng ? `&v${idx + 1}lng=${wp.lng}&v${idx + 1}lat=${wp.lat}` : ''
+          wp.lng && wp.lat
+            ? `&v${idx + 1}lng=${wp.lng}&v${idx + 1}lat=${wp.lat}`
+            : ''
         }`;
       });
+
+      deepLink += `&appname=com.hancomwith.fieldops`;
     }
 
     if (isMobile) {
@@ -1541,10 +1675,12 @@ export default function App() {
     } else {
       setNaviGuideModal({
         appName: app === 'tmap' ? 'TMAP' : '네이버 지도',
-        visits,
+        visits: displaySequence,
         webUrl:
           app === 'naver'
-            ? `https://map.naver.com/p/search/${encodeURIComponent(dest.name)}`
+            ? `https://map.naver.com/p/search/${encodeURIComponent(
+                finalDestNode.name
+              )}`
             : null,
       });
     }
@@ -1567,7 +1703,10 @@ export default function App() {
     .reduce((acc, item) => acc + item.distanceKm, 0);
 
   return (
-    <div className="min-h-screen bg-slate-100 flex justify-center font-sans text-slate-800">
+    <div
+      style={{ colorScheme: 'light' }}
+      className="min-h-screen bg-slate-100 flex justify-center font-sans text-slate-800"
+    >
       <div className="w-full max-w-md bg-white min-h-screen shadow-xl flex flex-col relative pb-20">
         {/* 상단 헤더 */}
         <header className="bg-slate-900 text-white px-5 py-4 shadow-md sticky top-0 z-20">
@@ -1733,7 +1872,7 @@ export default function App() {
                     value={searchKeyword}
                     onChange={(e) => setSearchKeyword(e.target.value)}
                     placeholder="예: 롯데월드, 판교역, 한국환경공단"
-                    className="flex-1 px-3.5 py-2.5 border border-slate-300 rounded-xl text-sm outline-none focus:border-blue-600"
+                    className="flex-1 px-3.5 py-2.5 bg-white text-slate-900 placeholder:text-slate-400 border border-slate-300 rounded-xl text-sm outline-none focus:border-blue-600"
                   />
                   <button
                     type="submit"
@@ -1781,7 +1920,7 @@ export default function App() {
                     value={newName}
                     onChange={(e) => setNewName(e.target.value)}
                     placeholder="상단 검색 시 자동 입력"
-                    className="w-full mt-1 px-3.5 py-2.5 border border-slate-300 rounded-xl text-sm outline-none focus:border-blue-600"
+                    className="w-full mt-1 px-3.5 py-2.5 bg-white text-slate-900 placeholder:text-slate-400 border border-slate-300 rounded-xl text-sm outline-none focus:border-blue-600"
                   />
                 </div>
 
@@ -1819,7 +1958,7 @@ export default function App() {
                     value={newAddress}
                     onChange={(e) => setNewAddress(e.target.value)}
                     placeholder="상단 검색 시 자동 입력"
-                    className="w-full mt-1 px-3.5 py-2.5 border border-slate-300 rounded-xl text-sm outline-none focus:border-blue-600"
+                    className="w-full mt-1 px-3.5 py-2.5 bg-white text-slate-900 placeholder:text-slate-400 border border-slate-300 rounded-xl text-sm outline-none focus:border-blue-600"
                   />
                 </div>
 
@@ -1857,7 +1996,7 @@ export default function App() {
                     value={newKnowHow}
                     onChange={(e) => setNewKnowHow(e.target.value)}
                     placeholder="예: 후문 공영주차장 이용, 방문증 수령 시 신분증 필수..."
-                    className="w-full mt-1 px-3.5 py-2.5 border border-slate-300 rounded-xl text-sm outline-none focus:border-blue-600"
+                    className="w-full mt-1 px-3.5 py-2.5 bg-white text-slate-900 placeholder:text-slate-400 border border-slate-300 rounded-xl text-sm outline-none focus:border-blue-600"
                   />
                 </div>
 
@@ -2145,22 +2284,16 @@ export default function App() {
                               )}
                             </div>
 
-                            <h4
-                              className={`font-bold mt-1.5 text-sm ${
-                                ev.type === 'VISIT'
-                                  ? 'text-slate-900'
-                                  : 'text-slate-700'
-                              }`}
-                            >
+                            <h3 className="font-bold text-sm text-slate-900 mt-1.5">
                               {ev.title}
-                            </h4>
-                            <p className="text-xs text-slate-500 mt-0.5 line-clamp-1">
+                            </h3>
+                            <p className="text-xs text-slate-500 mt-0.5">
                               {ev.address}
                             </p>
                             {ev.knowHow && (
-                              <p className="text-[11px] text-amber-800 bg-amber-100/60 px-2.5 py-1 rounded-lg mt-2 font-medium">
+                              <div className="mt-2 bg-white/80 border border-amber-200/70 rounded-xl px-2.5 py-1.5 text-[11px] text-amber-900 font-medium">
                                 💡 {ev.knowHow}
-                              </p>
+                              </div>
                             )}
                           </div>
                         </div>
@@ -2168,7 +2301,31 @@ export default function App() {
                     })}
                   </div>
 
-                  <div className="space-y-2.5 pt-2 border-t border-slate-100">
+                  <div className="space-y-2.5 pt-3 border-t border-slate-100">
+                    <div className="bg-slate-50 border border-slate-200/80 rounded-xl p-3 space-y-2">
+                      <label className="flex items-center justify-between cursor-pointer">
+                        <span className="text-xs font-bold text-slate-700">
+                          내비 출발지에 [{startPoint === 'HOME' ? '자택' : '회사'}] 포함
+                        </span>
+                        <input
+                          type="checkbox"
+                          checked={includeOriginInNavi}
+                          onChange={(e) => setIncludeOriginInNavi(e.target.checked)}
+                          className="w-4 h-4 accent-blue-600 rounded"
+                        />
+                      </label>
+                      <p className="text-[11px] text-slate-500 leading-relaxed">
+                        전송 경로:{' '}
+                        <strong className="text-slate-700">
+                          {includeOriginInNavi
+                            ? `${startPoint === 'HOME' ? '자택(출발)' : '회사(출발)'} → `
+                            : '현재 GPS 위치 → '}
+                          {plannedVisits.map((v) => v.name).join(' → ')} →{' '}
+                          {endPoint === 'HOME' ? '자택(도착)' : '회사(복귀)'}
+                        </strong>
+                      </p>
+                    </div>
+
                     <button
                       onClick={() => launchMultiNavi('tmap')}
                       className="w-full bg-[#00498c] hover:bg-[#003a70] text-white font-bold py-3.5 rounded-xl shadow-md flex items-center justify-center gap-2 text-sm transition-colors"
@@ -2233,7 +2390,7 @@ export default function App() {
                     value={homeSearchQuery}
                     onChange={(e) => setHomeSearchQuery(e.target.value)}
                     placeholder="자택 도로명 또는 아파트명 검색"
-                    className="flex-1 px-3 py-2 border border-slate-300 rounded-xl text-xs outline-none focus:border-blue-600"
+                    className="flex-1 px-3 py-2 bg-white text-slate-900 placeholder:text-slate-400 border border-slate-300 rounded-xl text-xs outline-none focus:border-blue-600"
                   />
                   <button
                     type="submit"
@@ -2275,7 +2432,7 @@ export default function App() {
                     type="text"
                     value={homeAddress}
                     onChange={(e) => setHomeAddress(e.target.value)}
-                    className="w-full mt-1 px-3.5 py-2.5 bg-slate-50 border border-slate-300 rounded-xl text-xs font-medium outline-none focus:border-blue-600 focus:bg-white"
+                    className="w-full mt-1 px-3.5 py-2.5 bg-slate-50 text-slate-900 placeholder:text-slate-400 border border-slate-300 rounded-xl text-xs font-medium outline-none focus:border-blue-600 focus:bg-white"
                   />
                 </div>
               </div>
@@ -2293,7 +2450,7 @@ export default function App() {
                     value={officeSearchQuery}
                     onChange={(e) => setOfficeSearchQuery(e.target.value)}
                     placeholder="회사 건물명 또는 도로명 검색"
-                    className="flex-1 px-3 py-2 border border-slate-300 rounded-xl text-xs outline-none focus:border-blue-600"
+                    className="flex-1 px-3 py-2 bg-white text-slate-900 placeholder:text-slate-400 border border-slate-300 rounded-xl text-xs outline-none focus:border-blue-600"
                   />
                   <button
                     type="submit"
@@ -2335,7 +2492,7 @@ export default function App() {
                     type="text"
                     value={officeAddress}
                     onChange={(e) => setOfficeAddress(e.target.value)}
-                    className="w-full mt-1 px-3.5 py-2.5 bg-slate-50 border border-slate-300 rounded-xl text-xs font-medium outline-none focus:border-blue-600 focus:bg-white"
+                    className="w-full mt-1 px-3.5 py-2.5 bg-slate-50 text-slate-900 placeholder:text-slate-400 border border-slate-300 rounded-xl text-xs font-medium outline-none focus:border-blue-600 focus:bg-white"
                   />
                 </div>
               </div>
