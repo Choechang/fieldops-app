@@ -54,53 +54,64 @@ const safeStorage = {
   },
 };
 
-// --- [초기 샘플 데이터 (DB가 비어있거나 오프라인일 때 기본 제공)] ---
-const INITIAL_CLIENTS = [
-  {
-    id: 101,
-    name: '잠실역',
-    type: 'MONTHLY',
-    address: '서울특별시 송파구 올림픽로 265',
-    knowHow: '8번 출구 인근 지하 주차장 이용 권장',
-    estimated_time: 30,
-    status: 'PENDING',
-    lat: 37.5132,
-    lng: 127.1001,
-  },
-  {
-    id: 102,
-    name: '롯데월드',
-    type: 'MONTHLY',
-    address: '서울특별시 송파구 올림픽로 240',
-    knowHow: '방문증 수령 시 명함 지참 필수',
-    estimated_time: 30,
-    status: 'PENDING',
-    lat: 37.5111,
-    lng: 127.0981,
-  },
-  {
-    id: 103,
-    name: '롯데마트 본사',
-    type: 'MONTHLY',
-    address: '서울특별시 송파구 올림픽로 269',
-    knowHow: '4000원 주차 지원, 전산실 3층',
-    estimated_time: 90,
-    status: 'PENDING',
-    lat: 37.5135,
-    lng: 127.1009,
-  },
-  {
-    id: 104,
-    name: '흥국화재',
-    type: 'QUARTERLY',
-    address: '전북특별자치도 전주시 완산구 팔달로 123',
-    knowHow: '건물 뒤편 지상 주차장 이용',
-    estimated_time: 60,
-    status: 'PENDING',
-    lat: 35.8242,
-    lng: 127.1479,
-  },
+// --- [초기 샘플 데이터 제거: 실제 등록된 고객사만 표시] ---
+const INITIAL_CLIENTS = [];
+
+// --- [한국 주요 시·구·동 내장 폴백 좌표 (모바일 통신망 지오코딩 지연 대비)] ---
+const KOREA_ADMIN_FALLBACK_COORDS = [
+  { keywords: ['수지구', '풍덕천', '죽전', '동천', '상현', '성복'], lat: 37.3221, lng: 127.0977 },
+  { keywords: ['기흥구', '신갈', '구갈', '보정', '영덕'], lat: 37.2747, lng: 127.1151 },
+  { keywords: ['분당구', '판교', '삼평', '백현', '정자', '서현', '야탑'], lat: 37.3947, lng: 127.1112 },
+  { keywords: ['송파구', '잠실', '신천', '문정', '가락'], lat: 37.5133, lng: 127.1001 },
+  { keywords: ['강남구', '역삼', '삼성', '테헤란', '선릉', '논현', '대치'], lat: 37.5006, lng: 127.0365 },
+  { keywords: ['서초구', '양재', '반포', '교대'], lat: 37.4836, lng: 127.0327 },
+  { keywords: ['영등포구', '여의도', '당산'], lat: 37.5219, lng: 126.9245 },
+  { keywords: ['중구', '을지로', '명동', '종로구', '광화문', '종각'], lat: 37.5663, lng: 126.9779 },
+  { keywords: ['마포구', '상암', '공덕', '합정'], lat: 37.5663, lng: 126.9016 },
+  { keywords: ['성동구', '성수', '왕십리'], lat: 37.5446, lng: 127.0559 },
+  { keywords: ['과천', '인덕원', '안양', '평촌'], lat: 37.4292, lng: 126.9877 },
+  { keywords: ['수원', '영통', '광교'], lat: 37.2636, lng: 127.0286 },
+  { keywords: ['인천', '송도', '부평'], lat: 37.4563, lng: 126.7052 },
+  { keywords: ['전주', '완산구', '덕진구'], lat: 35.8242, lng: 127.1479 },
+  { keywords: ['대전', '유성', '둔산'], lat: 36.3504, lng: 127.3845 },
+  { keywords: ['부산', '해운대', '서면'], lat: 35.1796, lng: 129.0756 },
 ];
+
+function getFallbackAdminCoords(text) {
+  if (!text) return null;
+  for (const entry of KOREA_ADMIN_FALLBACK_COORDS) {
+    if (entry.keywords.some((kw) => text.includes(kw))) {
+      return { lat: entry.lat, lng: entry.lng };
+    }
+  }
+  return null;
+}
+
+// --- [PC ↔ 휴대폰 간 know_how 필드 내 좌표/소요시간 메타데이터 동기화 헬퍼] ---
+function parseKnowHowMeta(rawKnowHow) {
+  const str = rawKnowHow || '';
+  const match = str.match(/\[\[META:([^\]]+)\]\]\s*$/);
+  if (!match) {
+    return { cleanKnowHow: str.trim(), meta: {} };
+  }
+  const cleanKnowHow = str.replace(match[0], '').trim();
+  const meta = {};
+  match[1].split(';').forEach((pair) => {
+    const [k, v] = pair.split('=');
+    if (k && v !== undefined) meta[k.trim()] = v.trim();
+  });
+  return { cleanKnowHow, meta };
+}
+
+function buildKnowHowWithMeta(cleanKnowHow, clientObj) {
+  const base = (cleanKnowHow || '').trim();
+  const lat = Number(clientObj?.lat) || 0;
+  const lng = Number(clientObj?.lng) || 0;
+  const time = Number(clientObj?.estimated_time) || 60;
+  const status = clientObj?.status || 'PENDING';
+  const metaTag = `[[META:lat=${lat};lng=${lng};time=${time};status=${status}]]`;
+  return base ? `${base} ${metaTag}` : metaTag;
+}
 
 // --- [두 좌표 간 직선 거리(km) 계산 (Haversine 공식)] ---
 function getDistanceKm(lat1, lng1, lat2, lng2) {
@@ -132,84 +143,43 @@ function getAddressSimilarity(addrA, addrB) {
 
 // --- [시간대별 수도권 교통 혼잡 계수 반환] ---
 function getTrafficProfile(departMinutes) {
-  const isMorningRush = departMinutes >= 8 * 60 && departMinutes <= 10 * 60;
-  const isEveningRush = departMinutes >= 17 * 60 && departMinutes <= 19 * 60;
+  const normalized = ((Math.round(departMinutes) % 1440) + 1440) % 1440;
+  const isMorningPeak = normalized >= 7 * 60 && normalized <= 9 * 60 + 30;
+  const isMorningShoulder =
+    normalized > 9 * 60 + 30 && normalized <= 10 * 60 + 30;
+  const isEveningShoulder = normalized >= 16 * 60 + 30 && normalized < 17 * 60;
+  const isEveningPeak = normalized >= 17 * 60 && normalized <= 20 * 60;
 
-  if (isMorningRush) {
-    return { multiplier: 1.45, avgSpeedKmh: 23, label: '오전 출근길 반영' };
-  }
-  if (isEveningRush) {
-    return { multiplier: 1.45, avgSpeedKmh: 22, label: '퇴근길 정체 반영' };
-  }
-  return { multiplier: 1.25, avgSpeedKmh: 32, label: '주간 평균 주행' };
-}
-
-// --- [모바일 오프라인/지연 대비 한국 주요 시·구·권역 기본 좌표 사전] ---
-const KOREA_ADMIN_FALLBACK_COORDS = [
-  { keys: ['수지구', '풍덕천', '죽전', '상현', '성복', '동천'], lat: 37.3221, lng: 127.0977 },
-  { keys: ['기흥구', '구갈', '신갈', '보정', '영덕'], lat: 37.2752, lng: 127.1156 },
-  { keys: ['처인구', '김량장', '역북'], lat: 37.2343, lng: 127.2013 },
-  { keys: ['용인시', '용인'], lat: 37.2411, lng: 127.1775 },
-  { keys: ['분당구', '판교', '정자', '서현', '야탑', '수내'], lat: 37.3827, lng: 127.1189 },
-  { keys: ['성남시', '성남', '수정구', '중원구'], lat: 37.4201, lng: 127.1265 },
-  { keys: ['송파구', '잠실', '문정', '가락', '방이'], lat: 37.5145, lng: 127.1059 },
-  { keys: ['강남구', '역삼', '삼성', '테헤란', '선릉', '압구정'], lat: 37.5172, lng: 127.0473 },
-  { keys: ['서초구', '양재', '반포', '교대'], lat: 37.4837, lng: 127.0324 },
-  { keys: ['강동구', '천호', '길동', '고덕'], lat: 37.5301, lng: 127.1238 },
-  { keys: ['영등포구', '여의도', '당산', '문래'], lat: 37.5264, lng: 126.9255 },
-  { keys: ['중구', '을지로', '명동', '종로구', '광화문'], lat: 37.5641, lng: 126.9979 },
-  { keys: ['마포구', '상암', '공덕', '홍대'], lat: 37.5663, lng: 126.9019 },
-  { keys: ['구로구', '금천구', '가산', '구로디지털'], lat: 37.4813, lng: 126.8825 },
-  { keys: ['수원시', '영통', '팔달', '권선', '장안', '광교'], lat: 37.2636, lng: 127.0286 },
-  { keys: ['화성시', '동탄', '병점'], lat: 37.2006, lng: 127.0725 },
-  { keys: ['안양시', '평촌', '동안구', '만안구', '과천'], lat: 37.3943, lng: 126.9568 },
-  { keys: ['인천', '부평', '송도', '남동구'], lat: 37.4563, lng: 126.7052 },
-  { keys: ['고양시', '일산', '덕양'], lat: 37.6584, lng: 126.8320 },
-  { keys: ['전주시', '완산구', '덕진구'], lat: 35.8242, lng: 127.1479 },
-  { keys: ['대전', '유성구', '서구'], lat: 36.3504, lng: 127.3845 },
-  { keys: ['대구', '수성구', '달서구'], lat: 35.8714, lng: 128.6014 },
-  { keys: ['부산', '해운대', '서면'], lat: 35.1796, lng: 129.0756 },
-  { keys: ['광주광역시', '상무지구'], lat: 35.1595, lng: 126.8526 },
-];
-
-function getFallbackAdminCoords(text) {
-  const target = (text || '').trim();
-  if (!target) return null;
-  for (const entry of KOREA_ADMIN_FALLBACK_COORDS) {
-    if (entry.keys.some((k) => target.includes(k))) {
-      return { lat: entry.lat, lng: entry.lng };
-    }
-  }
-  return null;
-}
-
-// --- [PC ↔ 휴대폰 간 좌표/소요시간/상태 동기화를 위한 메모 메타데이터 파서] ---
-function parseKnowHowMeta(rawKnowHow) {
-  const text = rawKnowHow || '';
-  const match = text.match(/\s*\[META:(\{.*?\})\]\s*$/);
-  if (!match) {
-    return { cleanKnowHow: text.trim(), meta: {} };
-  }
-  try {
-    const meta = JSON.parse(match[1]);
+  if (isMorningPeak) {
     return {
-      cleanKnowHow: text.replace(match[0], '').trim(),
-      meta: meta && typeof meta === 'object' ? meta : {},
+      multiplier: 1.75,
+      avgSpeedKmh: 19,
+      perKmPenaltyMins: 0.7,
+      label: '오전 출근길 정체 반영',
     };
-  } catch (e) {
-    return { cleanKnowHow: text.replace(match[0], '').trim(), meta: {} };
   }
-}
-
-function buildKnowHowWithMeta(cleanKnowHow, metaObj) {
-  const base = (cleanKnowHow || '').trim();
-  const payload = JSON.stringify({
-    lat: Number(metaObj.lat) || 0,
-    lng: Number(metaObj.lng) || 0,
-    time: Number(metaObj.estimated_time) || 60,
-    status: metaObj.status === 'COMPLETED' ? 'COMPLETED' : 'PENDING',
-  });
-  return base ? `${base} [META:${payload}]` : `[META:${payload}]`;
+  if (isEveningPeak) {
+    return {
+      multiplier: 1.8,
+      avgSpeedKmh: 18,
+      perKmPenaltyMins: 0.75,
+      label: '퇴근길 정체 반영',
+    };
+  }
+  if (isMorningShoulder || isEveningShoulder) {
+    return {
+      multiplier: 1.45,
+      avgSpeedKmh: 25,
+      perKmPenaltyMins: 0.35,
+      label: '출퇴근 인접 혼잡 반영',
+    };
+  }
+  return {
+    multiplier: 1.3,
+    avgSpeedKmh: 30,
+    perKmPenaltyMins: 0.15,
+    label: '주간 평균 주행',
+  };
 }
 
 // --- [OSRM 실제 도로 경로 + 수도권 교통량 보정 이동시간 계산] ---
@@ -232,7 +202,6 @@ async function calculateRealTravelInfo(fromPoint, toPoint, departMinutes, routeC
     toPoint.lng
   );
 
-  // 500m 이내 인접 건물은 주차 이동 없이 도보/단거리 5분 처리
   if (straightKm !== null && straightKm <= 0.5) {
     return {
       minutes: 5,
@@ -279,11 +248,13 @@ async function calculateRealTravelInfo(fromPoint, toPoint, departMinutes, routeC
   let finalKm = roadDistanceKm;
 
   if (baseDriveMins !== null && roadDistanceKm !== null) {
-    const parkingBuffer = roadDistanceKm < 2 ? 3 : 5;
-    totalMins = baseDriveMins * traffic.multiplier + parkingBuffer;
+    const parkingBuffer = roadDistanceKm < 2 ? 4 : roadDistanceKm < 10 ? 6 : 8;
+    const distanceCongestion = roadDistanceKm * traffic.perKmPenaltyMins;
+    totalMins =
+      baseDriveMins * traffic.multiplier + distanceCongestion + parkingBuffer;
   } else if (straightKm !== null) {
-    finalKm = straightKm * 1.35;
-    const parkingBuffer = finalKm < 2 ? 3 : 5;
+    finalKm = straightKm * 1.42;
+    const parkingBuffer = finalKm < 2 ? 4 : finalKm < 10 ? 6 : 8;
     totalMins = (finalKm / traffic.avgSpeedKmh) * 60 + parkingBuffer;
   }
 
@@ -350,14 +321,14 @@ export default function App() {
   const [officeSearchResults, setOfficeSearchResults] = useState([]);
   const [isSearchingOffice, setIsSearchingOffice] = useState(false);
 
-  // 카카오/다음 공식 주소·건물명 검색 모달 상태 ('client' | 'home' | 'office' | null)
+  // 카카오/다음 공식 주소·건물명 검색 모달 상태
   const [postcodeModalTarget, setPostcodeModalTarget] = useState(null);
   const [postcodeInitialQuery, setPostcodeInitialQuery] = useState('');
   const postcodeContainerRef = useRef(null);
 
-  // 출/퇴근(직출/직퇴) 옵션
-  const [startPoint, setStartPoint] = useState('HOME');
-  const [endPoint, setEndPoint] = useState('HOME');
+  // 출/퇴근(직출/직퇴) 옵션 (기본값: 회사 출발 · 회사 복귀)
+  const [startPoint, setStartPoint] = useState('OFFICE');
+  const [endPoint, setEndPoint] = useState('OFFICE');
 
   // 커스텀 알림/확인 모달 상태
   const [toastMessage, setToastMessage] = useState('');
@@ -434,7 +405,7 @@ export default function App() {
       if (!res.ok) throw new Error('DB 조회 실패');
       const data = await res.json();
 
-      if (Array.isArray(data) && data.length > 0) {
+      if (Array.isArray(data)) {
         const localCacheMap = {};
         localList.forEach((item) => {
           localCacheMap[item.name] = item;
@@ -511,7 +482,7 @@ export default function App() {
     return result;
   };
 
-  // --- [기업명/건물명 접미사 보정 (예: "한국투자증권 본사" -> "한국투자증권")] ---
+  // --- [기업명/건물명 접미사 보정] ---
   const stripKoreanOrgSuffix = (text) => {
     return text
       .replace(
@@ -521,7 +492,7 @@ export default function App() {
       .trim();
   };
 
-  // --- [지번 주소 패턴 판별 (예: "여의도동 27-1", "역삼동 123-4")] ---
+  // --- [지번 주소 패턴 판별] ---
   const isKoreanJibunQuery = (text) => {
     return /[가-힣0-9]+(동|읍|면|리|가)\s*\d+(-\d+)?/.test(text);
   };
@@ -554,7 +525,7 @@ export default function App() {
     }
   };
 
-  // --- [한국 지번·도로명·기업명 다중 엔진 통합 검색 (ArcGIS KOR + Photon + Nominatim)] ---
+  // --- [한국 지번·도로명·기업명 다중 엔진 통합 검색] ---
   const queryFlexiblePlaces = async (keyword) => {
     const raw = keyword.trim();
     if (!raw) return [];
@@ -565,7 +536,6 @@ export default function App() {
     const tokens = raw.split(/\s+/).filter(Boolean);
     const lastToken = tokens.length > 1 ? tokens[tokens.length - 1] : null;
 
-    // 모바일 통신망 지연으로 전체 검색이 멈추지 않도록 개별 API에 3.5초 타임아웃 적용
     const fetchJsonWithTimeout = (url, fallbackValue) => {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 3500);
@@ -575,7 +545,6 @@ export default function App() {
         .finally(() => clearTimeout(timer));
     };
 
-    // 1) ArcGIS 한국 지오코더 (langCode=ko 적용으로 한국어 주소 반환)
     const arcgisQueries = [normalized];
     if (coreOrgName && coreOrgName !== normalized && coreOrgName.length >= 2) {
       arcgisQueries.push(coreOrgName);
@@ -590,7 +559,6 @@ export default function App() {
       )
     );
 
-    // 2) Photon(lang=default로 현지 한국어 태그 우선) & Nominatim 보조 검색
     const osmTargetQuery = isJibun
       ? normalized.replace(/\s*\d+(-\d+)?\s*$/, '').trim()
       : coreOrgName || normalized;
@@ -602,7 +570,6 @@ export default function App() {
         )}&lang=default&limit=6&lat=37.5665&lon=126.9780`,
         { features: [] }
       ),
-
       fetchJsonWithTimeout(
         `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(
           osmTargetQuery
@@ -632,7 +599,6 @@ export default function App() {
 
     const combined = [];
 
-    // ArcGIS 한국 지번/POI 결과 최우선 반영 (한국 도로명 주소 점수 45점 이상 허용)
     arcgisResultsList.forEach((resData) => {
       const candidates = resData?.candidates || [];
       candidates.forEach((cand) => {
@@ -725,7 +691,11 @@ export default function App() {
         const structuredKoParts = [
           addr.province || addr.state,
           addr.city || addr.county,
-          addr.borough || addr.district || addr.suburb || addr.quarter || addr.neighbourhood,
+          addr.borough ||
+            addr.district ||
+            addr.suburb ||
+            addr.quarter ||
+            addr.neighbourhood,
           addr.road,
           addr.house_number,
         ].filter(Boolean);
@@ -797,7 +767,6 @@ export default function App() {
       return (a.sourcePriority || 2) - (b.sourcePriority || 2);
     });
 
-    // 영문으로 남아있는 결과가 있다면 좌표 기반 한국어 주소로 자동 변환
     const topCandidates = unique.slice(0, 8);
     const localizedResults = await Promise.all(
       topCandidates.map(async (item) => {
@@ -863,7 +832,6 @@ export default function App() {
       }
     }
 
-    // 모든 외부 API가 모바일 망에서 지연/차단될 경우 내장 시·구·동 좌표로 보정
     const fallbackAdmin =
       getFallbackAdminCoords(cleanAddr) || getFallbackAdminCoords(fallbackName);
     if (fallbackAdmin) {
@@ -873,7 +841,7 @@ export default function App() {
     return { lat: 0, lng: 0 };
   };
 
-  // --- [DB에 좌표 및 메타데이터 백그라운드 동기화 (PC ↔ 휴대폰 공유)] ---
+  // --- [DB에 좌표 및 메타데이터 백그라운드 동기화] ---
   const syncClientRecordToDb = async (clientObj) => {
     if (!isDbConnected || !clientObj?.id) return;
     try {
@@ -895,7 +863,6 @@ export default function App() {
         }
       );
 
-      // 확장 컬럼이 없는 DB 스키마인 경우 know_how 메타데이터로 좌표 동기화
       if (!res.ok) {
         await fetch(`${SUPABASE_URL}/rest/v1/clients?id=eq.${clientObj.id}`, {
           method: 'PATCH',
@@ -1554,8 +1521,7 @@ export default function App() {
           };
         })
       );
-      // 수도권 광역 권역(용인 수지 ↔ 송파 잠실 등 38km 이내) 안정적 포함
-      // 모바일 통신망에서 시/구 대표 좌표로 보정되더라도 동일 생활권 고객사가 누락되지 않도록 보완
+
       const sameZoneCandidates = enrichedCandidates
         .filter((cand) => {
           if (cand.distKm !== null) {
@@ -1571,10 +1537,10 @@ export default function App() {
         });
 
       const OFFICE_EARLIEST_DEPART = 9 * 60;
-      const DIRECT_ARRIVE_MIN = 9 * 60 + 30; // 직출 시 첫 고객사 09:30 도착 기준
+      const DIRECT_ARRIVE_MIN = 9 * 60 + 30;
       const LUNCH_START = 11 * 60 + 30;
       const LUNCH_END = 13 * 60;
-      const DIRECT_LEAVE_MIN = 17 * 60; // 직퇴 시 최소 17:00까지 고객사 상주 기준
+      const DIRECT_LEAVE_MIN = 17 * 60;
       const DAY_END = 17 * 60 + 30;
 
       const originPoint =
@@ -1582,12 +1548,23 @@ export default function App() {
           ? { ...activeHomeCoords, address: homeAddress }
           : { ...activeOfficeCoords, address: officeAddress };
 
-      const firstTravelInfo = await calculateRealTravelInfo(
+      let firstTravelInfo = await calculateRealTravelInfo(
         originPoint,
         seedClient,
-        OFFICE_EARLIEST_DEPART,
+        overrideStart === 'HOME' ? 8 * 60 + 30 : OFFICE_EARLIEST_DEPART,
         routeCacheRef.current
       );
+
+      if (overrideStart === 'HOME') {
+        const estimatedDepart = DIRECT_ARRIVE_MIN - firstTravelInfo.minutes;
+        firstTravelInfo = await calculateRealTravelInfo(
+          originPoint,
+          seedClient,
+          estimatedDepart,
+          routeCacheRef.current
+        );
+      }
+
       const firstTravel = firstTravelInfo.minutes;
       const firstWork = Number(seedClient.estimated_time) || 60;
 
@@ -1707,7 +1684,6 @@ export default function App() {
             }] 일정까지 연속 배정했습니다.`;
           }
         } else {
-          // 직출 시 오전 단독 일정이어도 반드시 09:30 고객사 도착 기준으로 출발 시각 역산
           const targetArrival = DIRECT_ARRIVE_MIN;
           const homeDepartTime = targetArrival - firstTravel;
 
@@ -2001,7 +1977,6 @@ export default function App() {
       while (finalVisitList.length < maxDailyVisits) {
         const prevClient = finalVisitList[finalVisitList.length - 1];
 
-        // 직전 방문 고객사 기준으로 가장 가까운 미방문 고객사 순으로 동적 정렬
         const sortByNearestFromPrev = (list) =>
           [...list].sort((a, b) => {
             const dA = getDistanceKm(
@@ -2026,7 +2001,6 @@ export default function App() {
           sameZoneCandidates.filter((c) => !usedIds.has(c.id))
         );
 
-        // 직퇴 시 17시 전까지 시간이 남았는데 38km 권역 후보가 소진된 경우, 인접 광역(65km 이내)까지 확장 탐색
         const extendedUnvisited =
           overrideEnd === 'HOME' &&
           currentTime < DIRECT_LEAVE_MIN &&
@@ -2239,7 +2213,7 @@ export default function App() {
     }
   };
 
-  // --- [안전한 클립보드 복사 유틸리티 (iFrame/모바일 호환)] ---
+  // --- [안전한 클립보드 복사 유틸리티] ---
   const copyTextSafe = (text, label = '주소') => {
     try {
       const textarea = document.createElement('textarea');
@@ -2264,7 +2238,7 @@ export default function App() {
     }
   };
 
-  // --- [TMAP 안드로이드·iOS 공용 단일 목적지 URL 생성 (goalname / goalx / goaly)] ---
+  // --- [TMAP 안드로이드·iOS 공용 단일 목적지 URL 생성] ---
   const buildSingleTmapUrl = (stop) => {
     const cleanName = (stop.name || '목적지')
       .replace(/[()]/g, ' ')
@@ -2281,13 +2255,12 @@ export default function App() {
       return `tmap://search?name=${encodeURIComponent(cleanName)}`;
     }
 
-    // 안드로이드·iOS TMAP 모두 목적지를 즉시 인식하는 표준 파라미터(goalname, goalx, goaly) 사용
     return `tmap://route?goalname=${encodeURIComponent(
       cleanName
     )}&goalx=${lng.toFixed(6)}&goaly=${lat.toFixed(6)}`;
   };
 
-  // --- [7. TMAP / 네이버 지도 길안내 페이로드 생성 (동기식 즉시 실행)] ---
+  // --- [7. TMAP / 네이버 지도 길안내 페이로드 생성] ---
   const buildNaviPayload = (app) => {
     const endItem = dailySchedule.find((item) => item.type === 'END');
 
@@ -2317,7 +2290,6 @@ export default function App() {
       }
     });
 
-    // 유효 좌표(lat/lng != 0) 필터링 및 초근접(50m 이내) 중복 지점 정리
     const validVisits = [];
     rawVisits.forEach((stop) => {
       if (!stop.lat || !stop.lng) return;
@@ -2364,19 +2336,15 @@ export default function App() {
     const waypointNodes = orderedStops.slice(0, orderedStops.length - 1);
     const finalDestNode = orderedStops[orderedStops.length - 1];
 
-    // 네이버 지도(최대 5개) 경유지 제한 준수
     const cappedWaypoints = waypointNodes.slice(0, 5);
     const displaySequence = [
       { id: 'gps-now', name: '현재 GPS 위치 (출발)', lat: 0, lng: 0 },
       ...orderedStops,
     ];
 
-    // TMAP은 웹 URL 스킴에서 단일 목적지(goalname/goalx/goaly)만 공식 인식하므로
-    // 첫 번째 목적지 URL을 기본 딥링크로 생성하고, 나머지 경유지는 순차 릴레이로 제공
     const firstTmapStop = orderedStops[0];
     const tmapFirstLink = buildSingleTmapUrl(firstTmapStop);
 
-    // 네이버 지도 공식 다중 경유지 스킴: 현위치 출발 기준 dlat/dlng/dname + v1~v5 + appname
     const cleanDestName = (finalDestNode.name || '목적지')
       .replace(/[()]/g, ' ')
       .replace(/\s+/g, ' ')
@@ -2416,7 +2384,7 @@ export default function App() {
     };
   };
 
-  // TMAP 특정 순번 목적지 즉시 실행 (동기식 사용자 제스처 유지)
+  // TMAP 특정 순번 목적지 즉시 실행
   const launchTmapStopByIndex = (stopIdx) => {
     const payload = buildNaviPayload('tmap');
     if (!payload || !payload.singleStops[stopIdx]) {
@@ -2453,7 +2421,6 @@ export default function App() {
     }
   };
 
-  // 반드시 동기 함수로 유지해야 iOS Safari / 모바일 Chrome에서 사용자 제스처가 유지됨
   const launchMultiNavi = (app, forcePreviewModal = false) => {
     const payload = buildNaviPayload(app);
     if (!payload) {
@@ -2479,7 +2446,6 @@ export default function App() {
     if (isMobile) {
       window.location.href = payload.deepLink;
 
-      // OS의 "앱에서 열겠습니까?" 시스템 확인창이 떠 있는 시간을 고려해 3.2초 후 폴백 안내
       setTimeout(() => {
         if (!document.hidden) {
           setNaviGuideModal({
@@ -2522,9 +2488,9 @@ export default function App() {
         <header className="bg-slate-900 text-white px-5 py-4 shadow-md sticky top-0 z-20">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
-              <ShieldCheck className="w-6 h-6 text-blue-400" />
-              <h1 className="font-bold text-lg tracking-tight">
-                FieldOps Scheduler
+              <ShieldCheck className="w-6 h-6 text-blue-400 shrink-0" />
+              <h1 className="font-bold text-base tracking-tight">
+                스마트 정기점검 동선 플래너
               </h1>
             </div>
             <button
@@ -2855,27 +2821,6 @@ export default function App() {
                       <button
                         type="button"
                         onClick={() => {
-                          setStartPoint('HOME');
-                          if (selectedSeedClient) {
-                            generateDailySchedule(
-                              selectedSeedClient,
-                              'HOME',
-                              endPoint,
-                              autoFillMorningGap
-                            );
-                          }
-                        }}
-                        className={`py-1.5 rounded-lg text-[11px] font-bold transition-colors ${
-                          startPoint === 'HOME'
-                            ? 'bg-white text-blue-700 shadow-sm'
-                            : 'text-slate-500'
-                        }`}
-                      >
-                        자택(직출)
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => {
                           setStartPoint('OFFICE');
                           if (selectedSeedClient) {
                             generateDailySchedule(
@@ -2894,6 +2839,27 @@ export default function App() {
                       >
                         회사 출발
                       </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setStartPoint('HOME');
+                          if (selectedSeedClient) {
+                            generateDailySchedule(
+                              selectedSeedClient,
+                              'HOME',
+                              endPoint,
+                              autoFillMorningGap
+                            );
+                          }
+                        }}
+                        className={`py-1.5 rounded-lg text-[11px] font-bold transition-colors ${
+                          startPoint === 'HOME'
+                            ? 'bg-white text-blue-700 shadow-sm'
+                            : 'text-slate-500'
+                        }`}
+                      >
+                        자택(직출)
+                      </button>
                     </div>
                   </div>
 
@@ -2902,27 +2868,6 @@ export default function App() {
                       오후 복귀지
                     </label>
                     <div className="grid grid-cols-2 gap-1 bg-slate-100 p-1 rounded-xl">
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setEndPoint('HOME');
-                          if (selectedSeedClient) {
-                            generateDailySchedule(
-                              selectedSeedClient,
-                              startPoint,
-                              'HOME',
-                              autoFillMorningGap
-                            );
-                          }
-                        }}
-                        className={`py-1.5 rounded-lg text-[11px] font-bold transition-colors ${
-                          endPoint === 'HOME'
-                            ? 'bg-white text-blue-700 shadow-sm'
-                            : 'text-slate-500'
-                        }`}
-                      >
-                        자택(직퇴)
-                      </button>
                       <button
                         type="button"
                         onClick={() => {
@@ -2944,11 +2889,31 @@ export default function App() {
                       >
                         회사 복귀
                       </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setEndPoint('HOME');
+                          if (selectedSeedClient) {
+                            generateDailySchedule(
+                              selectedSeedClient,
+                              startPoint,
+                              'HOME',
+                              autoFillMorningGap
+                            );
+                          }
+                        }}
+                        className={`py-1.5 rounded-lg text-[11px] font-bold transition-colors ${
+                          endPoint === 'HOME'
+                            ? 'bg-white text-blue-700 shadow-sm'
+                            : 'text-slate-500'
+                        }`}
+                      >
+                        자택(직퇴)
+                      </button>
                     </div>
                   </div>
                 </div>
 
-                {/* 직출 09:30 / 직퇴 17:00 적용 규칙 안내 배지 */}
                 <div className="flex flex-wrap gap-1.5 pt-0.5">
                   <span
                     className={`text-[10px] font-bold px-2.5 py-1 rounded-lg border ${
@@ -3153,7 +3118,9 @@ export default function App() {
                           <input
                             type="checkbox"
                             checked={includeReturnInNavi}
-                            onChange={(e) => setIncludeReturnInNavi(e.target.checked)}
+                            onChange={(e) =>
+                              setIncludeReturnInNavi(e.target.checked)
+                            }
                             className="w-4 h-4 accent-blue-600 rounded"
                           />
                           <span className="text-xs font-bold text-slate-700">
@@ -3730,7 +3697,7 @@ export default function App() {
   );
 }
 
-// --- [좌측 스와이프 점검 완료 카드 컴포넌트 (모바일 세로 스크롤 간섭 방지 적용)] ---
+// --- [좌측 스와이프 점검 완료 카드 컴포넌트] ---
 function SwipeableClientCard({
   client,
   onComplete,
