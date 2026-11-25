@@ -35,6 +35,18 @@ import {
 const SUPABASE_URL = 'https://rvzyjcsqdebhtqauapfi.supabase.co';
 const SUPABASE_ANON_KEY = 'sb_publishable_060rzT1Fy508DxwlQ9XC3w_vwb8uu3P';
 
+// 신형(sb_publishable_) 및 구형(eyJ...) 키 모두 호환되는 인증 헤더 생성
+const getSupabaseHeaders = (extraHeaders = {}) => {
+  const headers = {
+    apikey: SUPABASE_ANON_KEY,
+    ...extraHeaders,
+  };
+  if (SUPABASE_ANON_KEY.startsWith('eyJ')) {
+    headers.Authorization = `Bearer ${SUPABASE_ANON_KEY}`;
+  }
+  return headers;
+};
+
 // --- [샌드박스/시크릿 모드 안전 스토리지 유틸리티] ---
 const memoryStorage = {};
 const safeStorage = {
@@ -396,10 +408,7 @@ export default function App() {
       const res = await fetch(
         `${SUPABASE_URL}/rest/v1/clients?select=*&order=id.desc`,
         {
-          headers: {
-            apikey: SUPABASE_ANON_KEY,
-            Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
-          },
+          headers: getSupabaseHeaders(),
         }
       );
       if (!res.ok) throw new Error('DB 조회 실패');
@@ -465,12 +474,10 @@ export default function App() {
     try {
       let res = await fetch(`${SUPABASE_URL}/rest/v1/clients`, {
         method: 'POST',
-        headers: {
-          apikey: SUPABASE_ANON_KEY,
-          Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+        headers: getSupabaseHeaders({
           'Content-Type': 'application/json',
           Prefer: 'return=representation',
-        },
+        }),
         body: JSON.stringify({
           name: clientObj.name,
           type: clientObj.type,
@@ -486,12 +493,10 @@ export default function App() {
       if (!res.ok) {
         res = await fetch(`${SUPABASE_URL}/rest/v1/clients`, {
           method: 'POST',
-          headers: {
-            apikey: SUPABASE_ANON_KEY,
-            Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+          headers: getSupabaseHeaders({
             'Content-Type': 'application/json',
             Prefer: 'return=representation',
-          },
+          }),
           body: JSON.stringify({
             name: clientObj.name,
             type: clientObj.type,
@@ -504,12 +509,10 @@ export default function App() {
       if (!res.ok) {
         res = await fetch(`${SUPABASE_URL}/rest/v1/clients`, {
           method: 'POST',
-          headers: {
-            apikey: SUPABASE_ANON_KEY,
-            Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+          headers: getSupabaseHeaders({
             'Content-Type': 'application/json',
             Prefer: 'return=representation',
-          },
+          }),
           body: JSON.stringify({
             name: clientObj.name,
             address: clientObj.address,
@@ -928,11 +931,9 @@ export default function App() {
         `${SUPABASE_URL}/rest/v1/clients?id=eq.${clientObj.id}`,
         {
           method: 'PATCH',
-          headers: {
-            apikey: SUPABASE_ANON_KEY,
-            Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+          headers: getSupabaseHeaders({
             'Content-Type': 'application/json',
-          },
+          }),
           body: JSON.stringify({
             lat: clientObj.lat,
             lng: clientObj.lng,
@@ -945,11 +946,9 @@ export default function App() {
       if (!res.ok) {
         await fetch(`${SUPABASE_URL}/rest/v1/clients?id=eq.${clientObj.id}`, {
           method: 'PATCH',
-          headers: {
-            apikey: SUPABASE_ANON_KEY,
-            Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+          headers: getSupabaseHeaders({
             'Content-Type': 'application/json',
-          },
+          }),
           body: JSON.stringify({
             know_how: buildKnowHowWithMeta(clientObj.knowHow, clientObj),
           }),
@@ -1310,11 +1309,9 @@ export default function App() {
       try {
         const res = await fetch(`${SUPABASE_URL}/rest/v1/clients?id=eq.${id}`, {
           method: 'PATCH',
-          headers: {
-            apikey: SUPABASE_ANON_KEY,
-            Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+          headers: getSupabaseHeaders({
             'Content-Type': 'application/json',
-          },
+          }),
           body: JSON.stringify({ status: newStatus }),
         });
         if (!res.ok) {
@@ -1356,11 +1353,9 @@ export default function App() {
                 `${SUPABASE_URL}/rest/v1/clients?id=eq.${visit.id}`,
                 {
                   method: 'PATCH',
-                  headers: {
-                    apikey: SUPABASE_ANON_KEY,
-                    Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+                  headers: getSupabaseHeaders({
                     'Content-Type': 'application/json',
-                  },
+                  }),
                   body: JSON.stringify({ status: 'COMPLETED' }),
                 }
               );
@@ -1394,10 +1389,7 @@ export default function App() {
           try {
             await fetch(`${SUPABASE_URL}/rest/v1/clients?id=eq.${id}`, {
               method: 'DELETE',
-              headers: {
-                apikey: SUPABASE_ANON_KEY,
-                Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
-              },
+              headers: getSupabaseHeaders(),
             });
           } catch (err) {
             // DB 삭제 실패 시 무시
