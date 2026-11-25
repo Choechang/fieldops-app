@@ -434,18 +434,97 @@ export default function App() {
             lng: Number(row.lng) || Number(meta.lng) || cached.lng || 0,
           };
         });
-        setClients(formatted);
-        saveLocalClients(formatted);
+
+        // DB가 비어있는데 로컬에 기존 저장된 목록이 있으면 자동으로 DB에 재동기화
+        if (formatted.length === 0 && localList.length > 0) {
+          setClients(localList);
+          setIsDbConnected(true);
+          for (const localItem of localList) {
+            await insertClientToSupabase(localItem);
+          }
+        } else {
+          setClients(formatted);
+          saveLocalClients(formatted);
+          setIsDbConnected(true);
+        }
       } else {
         setClients(localList);
+        setIsDbConnected(true);
       }
-      setIsDbConnected(true);
     } catch (error) {
       setClients(localList);
       setIsDbConnected(false);
     } finally {
       setIsLoadingDb(false);
     }
+  };
+
+  // --- [Supabase 안전 Insert 헬퍼 (컬럼 불일치 시 최소 컬럼 폴백)] ---
+  const insertClientToSupabase = async (clientObj) => {
+    if (!hasSupabaseConfig) return null;
+    try {
+      let res = await fetch(`${SUPABASE_URL}/rest/v1/clients`, {
+        method: 'POST',
+        headers: {
+          apikey: SUPABASE_ANON_KEY,
+          Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+          'Content-Type': 'application/json',
+          Prefer: 'return=representation',
+        },
+        body: JSON.stringify({
+          name: clientObj.name,
+          type: clientObj.type,
+          address: clientObj.address,
+          know_how: buildKnowHowWithMeta(clientObj.knowHow, clientObj),
+          estimated_time: clientObj.estimated_time,
+          status: clientObj.status || 'PENDING',
+          lat: clientObj.lat,
+          lng: clientObj.lng,
+        }),
+      });
+
+      if (!res.ok) {
+        res = await fetch(`${SUPABASE_URL}/rest/v1/clients`, {
+          method: 'POST',
+          headers: {
+            apikey: SUPABASE_ANON_KEY,
+            Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+            'Content-Type': 'application/json',
+            Prefer: 'return=representation',
+          },
+          body: JSON.stringify({
+            name: clientObj.name,
+            type: clientObj.type,
+            address: clientObj.address,
+            know_how: buildKnowHowWithMeta(clientObj.knowHow, clientObj),
+          }),
+        });
+      }
+
+      if (!res.ok) {
+        res = await fetch(`${SUPABASE_URL}/rest/v1/clients`, {
+          method: 'POST',
+          headers: {
+            apikey: SUPABASE_ANON_KEY,
+            Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+            'Content-Type': 'application/json',
+            Prefer: 'return=representation',
+          },
+          body: JSON.stringify({
+            name: clientObj.name,
+            address: clientObj.address,
+          }),
+        });
+      }
+
+      if (res.ok) {
+        const inserted = await res.json();
+        return Array.isArray(inserted) && inserted[0]?.id ? inserted[0].id : null;
+      }
+    } catch (e) {
+      // 네트워크 오류 시 null 반환
+    }
+    return null;
   };
 
   useEffect(() => {
@@ -1141,61 +1220,17 @@ export default function App() {
     setClients(optimisticList);
     saveLocalClients(optimisticList);
 
-    if (isDbConnected) {
-      try {
-        let res = await fetch(`${SUPABASE_URL}/rest/v1/clients`, {
-          method: 'POST',
-          headers: {
-            apikey: SUPABASE_ANON_KEY,
-            Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
-            'Content-Type': 'application/json',
-            Prefer: 'return=representation',
-          },
-          body: JSON.stringify({
-            name: newClientObj.name,
-            type: newClientObj.type,
-            address: newClientObj.address,
-            know_how: newClientObj.knowHow,
-            estimated_time: newClientObj.estimated_time,
-            status: 'PENDING',
-            lat: newClientObj.lat,
-            lng: newClientObj.lng,
-          }),
-        });
-
-        if (!res.ok) {
-          res = await fetch(`${SUPABASE_URL}/rest/v1/clients`, {
-            method: 'POST',
-            headers: {
-              apikey: SUPABASE_ANON_KEY,
-              Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
-              'Content-Type': 'application/json',
-              Prefer: 'return=representation',
-            },
-            body: JSON.stringify({
-              name: newClientObj.name,
-              type: newClientObj.type,
-              address: newClientObj.address,
-              know_how: buildKnowHowWithMeta(
-                newClientObj.knowHow,
-                newClientObj
-              ),
-            }),
-          });
-        }
-
-        if (res.ok) {
-          const inserted = await res.json();
-          if (Array.isArray(inserted) && inserted[0]?.id) {
-            const syncedList = optimisticList.map((item) =>
-              item.id === newClientObj.id ? { ...item, id: inserted[0].id } : item
-            );
-            setClients(syncedList);
-            saveLocalClients(syncedList);
-          }
-        }
-      } catch (err) {
-        // 네트워크 실패 시 로컬 유지
+    if (hasSupabaseConfig) {
+      const insertedId = await insertClientToSupabase(newClientObj);
+      if (insertedId) {
+        setIsDbConnected(true);
+        const syncedList = optimisticList.map((item) =>
+          item.id === newClientObj.id ? { ...item, id: insertedId } : item
+        );
+        setClients(syncedList);
+        saveLocalClients(syncedList);
+      } else {
+        showToast('로컬에 저장되었습니다. (클라우드 DB 쓰기 권한을 확인해 주세요)');
       }
     }
 
@@ -1209,22 +1244,69 @@ export default function App() {
     showToast('고객사가 등록되었습니다.');
   };
 
-  // --- [4. 점검 상태 변경 (완료 / 복구)] ---
+  // --- [고객사 목록 백업 내보내기 / 불러오기] ---
+  const handleExportClients = () => {
+    if (clients.length === 0) {
+      showToast('백업할 고객사 목록이 없습니다.');
+      return;
+    }
+    const jsonStr = JSON.stringify(clients, null, 2);
+    copyTextSafe(jsonStr, '전체 고객사 백업 데이터');
+  };
+
+  const [backupInputText, setBackupInputText] = useState('');
+  const [showBackupModal, setShowBackupModal] = useState(false);
+
+  const handleImportClients = async () => {
+    try {
+      const parsed = JSON.parse(backupInputText.trim());
+      if (!Array.isArray(parsed) || parsed.length === 0) {
+        showToast('올바른 고객사 백업 데이터(JSON 배열)를 붙여넣어 주세요.');
+        return;
+      }
+      const normalized = parsed.map((item, idx) => ({
+        id: item.id || Date.now() + idx,
+        name: item.name || '이름 없음',
+        type: item.type === 'QUARTERLY' ? 'QUARTERLY' : 'MONTHLY',
+        address: item.address || '',
+        knowHow: item.knowHow || item.know_how || '',
+        estimated_time: Number(item.estimated_time) || 60,
+        status: item.status === 'COMPLETED' ? 'COMPLETED' : 'PENDING',
+        lat: Number(item.lat) || 0,
+        lng: Number(item.lng) || 0,
+      }));
+
+      setClients(normalized);
+      saveLocalClients(normalized);
+      setShowBackupModal(false);
+      setBackupInputText('');
+      showToast(`${normalized.length}개 고객사 목록을 복원했습니다.`);
+
+      if (hasSupabaseConfig) {
+        for (const item of normalized) {
+          await insertClientToSupabase(item);
+        }
+        await fetchClients();
+      }
+    } catch (e) {
+      showToast('백업 데이터 형식이 올바르지 않습니다.');
+    }
+  };
+
+  // --- [4. 점검 상태 변경 (좌측 스와이프 완료 처리 & 복구)] ---
   const handleUpdateStatus = async (id, newStatus) => {
     const updated = clients.map((c) =>
       c.id === id ? { ...c, status: newStatus } : c
     );
     setClients(updated);
     saveLocalClients(updated);
-
-    if (newStatus === 'COMPLETED') {
-      showToast('점검 완료 처리되었습니다.');
-    } else {
-      showToast('진행 대기 상태로 복구되었습니다.');
-    }
+    showToast(
+      newStatus === 'COMPLETED'
+        ? '점검 완료 처리되었습니다.'
+        : '진행 대기 목록으로 복구되었습니다.'
+    );
 
     if (isDbConnected) {
-      const targetClient = updated.find((c) => c.id === id);
       try {
         const res = await fetch(`${SUPABASE_URL}/rest/v1/clients?id=eq.${id}`, {
           method: 'PATCH',
@@ -1235,13 +1317,66 @@ export default function App() {
           },
           body: JSON.stringify({ status: newStatus }),
         });
-        if (!res.ok && targetClient) {
-          await syncClientRecordToDb(targetClient);
+        if (!res.ok) {
+          const targetClient = updated.find((c) => c.id === id);
+          if (targetClient) {
+            await syncClientRecordToDb(targetClient);
+          }
         }
       } catch (err) {
-        // DB 컬럼 미생성 시 무시
+        // DB 상태 변경 실패 시 로컬 상태 유지
       }
     }
+  };
+
+  // --- [4-2. 일과표 배정 고객사 일괄 점검 완료 처리] ---
+  const handleCompletePlannedSchedule = () => {
+    if (!plannedVisits || plannedVisits.length === 0) return;
+    const visitNames = plannedVisits.map((v) => v.name).join(', ');
+    setConfirmDialog({
+      title: '일정 진행 및 일괄 완료 처리',
+      confirmLabel: '진행 확정 (완료 처리)',
+      confirmStyle: 'bg-emerald-600 hover:bg-emerald-700',
+      msg: `배정된 ${plannedVisits.length}곳(${visitNames}) 일정을 진행 확정하고 '점검 완료된 현장'으로 이동하시겠습니까?`,
+      action: async () => {
+        const targetIds = new Set(plannedVisits.map((v) => v.id));
+        const updated = clients.map((c) =>
+          targetIds.has(c.id) ? { ...c, status: 'COMPLETED' } : c
+        );
+        setClients(updated);
+        saveLocalClients(updated);
+        setConfirmDialog(null);
+        setActiveTab('list');
+        showToast(`${plannedVisits.length}곳 고객사가 점검 완료 처리되었습니다.`);
+
+        if (isDbConnected) {
+          for (const visit of plannedVisits) {
+            try {
+              const res = await fetch(
+                `${SUPABASE_URL}/rest/v1/clients?id=eq.${visit.id}`,
+                {
+                  method: 'PATCH',
+                  headers: {
+                    apikey: SUPABASE_ANON_KEY,
+                    Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+                    'Content-Type': 'application/json',
+                  },
+                  body: JSON.stringify({ status: 'COMPLETED' }),
+                }
+              );
+              if (!res.ok) {
+                const targetClient = updated.find((c) => c.id === visit.id);
+                if (targetClient) {
+                  await syncClientRecordToDb(targetClient);
+                }
+              }
+            } catch (err) {
+              // 개별 DB 동기화 실패 시 무시
+            }
+          }
+        }
+      },
+    });
   };
 
   // --- [5. 고객사 삭제] ---
@@ -3256,6 +3391,17 @@ export default function App() {
                       <Map className="w-4 h-4 text-green-100" />
                       <span>네이버 지도 다중 경유지 한 번에 전송</span>
                     </button>
+
+                    <button
+                      type="button"
+                      onClick={handleCompletePlannedSchedule}
+                      className="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-bold py-3.5 rounded-xl shadow-md flex items-center justify-center gap-2 text-sm transition-colors"
+                    >
+                      <Check className="w-4 h-4 text-emerald-100" />
+                      <span>
+                        이 일정대로 진행 확정 ({plannedVisits.length}곳 일괄 완료 처리)
+                      </span>
+                    </button>
                   </div>
                 </div>
               ) : (
@@ -3452,6 +3598,37 @@ export default function App() {
               >
                 설정 저장하기
               </button>
+
+              {/* 고객사 데이터 영구 백업 및 복원 */}
+              <div className="bg-white p-5 rounded-2xl border border-slate-200 shadow-sm space-y-3">
+                <div>
+                  <h3 className="font-bold text-sm text-slate-900 flex items-center gap-1.5">
+                    <Database className="w-4 h-4 text-emerald-600" />
+                    <span>고객사 데이터 백업 / 복원 (초기화 방지)</span>
+                  </h3>
+                  <p className="text-xs text-slate-500 mt-1 leading-relaxed">
+                    등록한 고객사 목록을 클립보드로 복사해 메모장·카톡에 보관해 두시면, 기기를 바꾸거나 재배포해도 1초 만에 전체 복원할 수 있습니다.
+                  </p>
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    onClick={handleExportClients}
+                    className="py-2.5 px-3 bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border border-emerald-200 rounded-xl text-xs font-bold flex items-center justify-center gap-1.5"
+                  >
+                    <Copy className="w-3.5 h-3.5" />
+                    <span>목록 백업 복사 ({clients.length}건)</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setShowBackupModal(true)}
+                    className="py-2.5 px-3 bg-blue-50 hover:bg-blue-100 text-blue-800 border border-blue-200 rounded-xl text-xs font-bold flex items-center justify-center gap-1.5"
+                  >
+                    <RotateCcw className="w-3.5 h-3.5" />
+                    <span>백업 데이터 복원</span>
+                  </button>
+                </div>
+              </div>
             </div>
           )}
         </main>
@@ -3658,14 +3835,19 @@ export default function App() {
           </div>
         )}
 
-        {/* 삭제 확인 커스텀 모달 */}
+        {/* 삭제 및 진행 확인 커스텀 모달 */}
         {confirmDialog && (
           <div className="fixed inset-0 bg-black/60 flex items-center justify-center p-5 z-50">
-            <div className="bg-white rounded-2xl p-6 w-full max-w-sm shadow-xl">
-              <h3 className="font-bold text-base text-slate-800 mb-4">
+            <div className="bg-white rounded-2xl p-6 w-full max-w-sm shadow-xl space-y-4">
+              {confirmDialog.title && (
+                <h3 className="font-bold text-base text-slate-900">
+                  {confirmDialog.title}
+                </h3>
+              )}
+              <p className="font-medium text-sm text-slate-700 leading-relaxed">
                 {confirmDialog.msg}
-              </h3>
-              <div className="flex gap-3">
+              </p>
+              <div className="flex gap-3 pt-1">
                 <button
                   onClick={() => setConfirmDialog(null)}
                   className="flex-1 bg-slate-200 text-slate-700 font-bold py-3 rounded-xl text-sm"
@@ -3674,9 +3856,51 @@ export default function App() {
                 </button>
                 <button
                   onClick={confirmDialog.action}
-                  className="flex-1 bg-red-600 text-white font-bold py-3 rounded-xl text-sm"
+                  className={`flex-1 text-white font-bold py-3 rounded-xl text-sm ${
+                    confirmDialog.confirmStyle || 'bg-red-600'
+                  }`}
                 >
-                  삭제
+                  {confirmDialog.confirmLabel || '삭제'}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* 백업 데이터 붙여넣기 복원 모달 */}
+        {showBackupModal && (
+          <div className="fixed inset-0 bg-black/60 flex items-center justify-center p-5 z-50">
+            <div className="bg-white rounded-2xl p-5 w-full max-w-sm shadow-xl space-y-3">
+              <h3 className="font-bold text-base text-slate-900">
+                고객사 백업 데이터 복원
+              </h3>
+              <p className="text-xs text-slate-500">
+                이전에 복사해 둔 백업 텍스트(JSON)를 아래에 붙여넣고 복원 버튼을 누르세요.
+              </p>
+              <textarea
+                rows={5}
+                value={backupInputText}
+                onChange={(e) => setBackupInputText(e.target.value)}
+                placeholder='[{"name":"한국투자증권","address":"..."}]'
+                className="w-full p-3 border border-slate-300 rounded-xl text-xs font-mono outline-none focus:border-blue-600"
+              />
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowBackupModal(false);
+                    setBackupInputText('');
+                  }}
+                  className="flex-1 bg-slate-200 text-slate-700 font-bold py-2.5 rounded-xl text-xs"
+                >
+                  취소
+                </button>
+                <button
+                  type="button"
+                  onClick={handleImportClients}
+                  className="flex-1 bg-blue-600 hover:bg-blue-700 text-white font-bold py-2.5 rounded-xl text-xs"
+                >
+                  일괄 복원하기
                 </button>
               </div>
             </div>
